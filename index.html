@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#111827">
+<title>CloudPC</title>
+<style>
+:root{color-scheme:dark;font-family:system-ui,-apple-system,Segoe UI,sans-serif}
+*{box-sizing:border-box}body{margin:0;min-height:100vh;background:radial-gradient(ellipse at 20% 0,#243b63,#101827 55%);color:#f8fafc;display:grid;place-items:center;padding:24px}
+main{width:min(720px,100%);background:#111c2dcc;border:1px solid #52627a66;border-radius:22px;padding:clamp(24px,5vw,44px);box-shadow:0 24px 90px #0008}
+.mark{font-size:13px;letter-spacing:.16em;text-transform:uppercase;color:#9db6db;font-weight:700}
+h1{font-size:clamp(36px,7vw,58px);margin:12px 0 8px;letter-spacing:-.05em}
+p{color:#bdc9da;line-height:1.65}
+a.button{display:inline-flex;margin:20px 0 10px;padding:14px 22px;border-radius:12px;background:#78a9ff;color:#081326;text-decoration:none;font-weight:800}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px;margin-top:24px}
+article{padding:16px;border:1px solid #ffffff18;border-radius:14px;background:#ffffff08}
+article b{display:block;margin-bottom:5px}small{color:#9eacc0}
+footer{margin-top:26px;color:#8190a6;font-size:12px}
+</style>
+</head>
+<body>
+<main>
+  <div class="mark">Your private cloud desktop</div>
+  <h1>CloudPC</h1>
+  <p>A lightweight Linux desktop with Prism Launcher and Java 21. Connect using the VNC password shown in your Altare container's first-start logs.</p>
+  <a class="button" href="/vnc.html?autoconnect=true&resize=remote&quality=6&compression=2">Open desktop ↗</a>
+  <div class="grid">
+    <article><b>XFCE desktop</b><small>Lightweight Linux GUI</small></article>
+    <article><b>Prism Launcher</b><small>Multiple Minecraft instances</small></article>
+    <article><b>Persistent data</b><small>Keep /data mounted between redeploys</small></article>
+  </div>
+  <footer>CloudPC is an independent community project. Minecraft and Prism Launcher are not affiliated with Altare.</footer>
+</main>
+</body>
+</html>
