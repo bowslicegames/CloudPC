@@ -21,7 +21,7 @@ RUN printf '%s\n' \
  && apt-get update \
  && apt-get install -y --no-install-recommends \
       ca-certificates curl wget gnupg \
-      xvfb x11vnc novnc websockify \
+      xvfb x11vnc novnc websockify x11-utils \
       xfce4-session xfce4-panel xfce4-terminal xfdesktop4 xfwm4 \
       thunar mousepad dbus-x11 \
       fonts-dejavu fonts-liberation \
@@ -31,7 +31,11 @@ RUN printf '%s\n' \
  && apt-get clean \
  && rm -rf /var/lib/apt/lists/* \
  && useradd --create-home --shell /bin/bash cloud \
- && mkdir -p /data /opt/cloudpc \
+ && chmod 1777 /tmp \
+ && mkdir -p /tmp/.X11-unix /data /opt/cloudpc \
+ && chown root:root /tmp/.X11-unix \
+ && chmod 1777 /tmp/.X11-unix \
+
  && chown -R cloud:cloud /home/cloud /data
 
 COPY entrypoint.sh /opt/cloudpc/entrypoint.sh
