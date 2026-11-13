@@ -65,17 +65,41 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
+echo "CloudPC: preparing X11 socket directory..."
+chmod 1777 /tmp
+mkdir -p /tmp/.X11-unix
+chown root:root /tmp/.X11-unix
+chmod 1777 /tmp/.X11-unix
+rm -f /tmp/.X0-lock /tmp/.X11-unix/X0
+
 echo "CloudPC: starting virtual display ${SCREEN_WIDTH}x${SCREEN_HEIGHT}..."
 runuser -u cloud -- env HOME=/home/cloud DISPLAY=:0 \
   Xvfb :0 -screen 0 "${SCREEN_WIDTH}x${SCREEN_HEIGHT}x${SCREEN_DEPTH}" \
-  -nolisten tcp -noreset &
+  -nolisten tcp -noreset -ac &
 XVFB_PID=$!
 
-for _ in $(seq 1 40); do
-  if xdpyinfo -display :0 >/dev/null 2>&1; then break; fi
+DISPLAY_READY=0
+for _ in $(seq 1 60); do
+  if ! kill -0 "$XVFB_PID" 2>/dev/null; then
+    echo "ERROR: Xvfb process exited during startup."
+    wait "$XVFB_PID" || true
+    break
+  fi
+  if xdpyinfo -display :0 >/dev/null 2>&1; then
+    DISPLAY_READY=1
+    break
+  fi
   sleep 0.5
 done
-xdpyinfo -display :0 >/dev/null 2>&1 || { echo "Xvfb failed to start"; exit 1; }
+if [[ "$DISPLAY_READY" != "1" ]]; then
+  echo "ERROR: Xvfb did not become ready. Diagnostics:"
+  command -v Xvfb || true
+  command -v xdpyinfo || true
+  ls -ld /tmp /tmp/.X11-unix || true
+  ls -la /tmp/.X11-unix || true
+  ps aux | grep '[X]vfb' || true
+  exit 1
+fi
 
 echo "CloudPC: starting XFCE desktop..."
 runuser -u cloud -- env HOME=/home/cloud DISPLAY=:0 \
@@ -98,7 +122,9 @@ echo "CloudPC: serving noVNC on 0.0.0.0:${NOVNC_PORT}"
 websockify --web=/usr/share/novnc "0.0.0.0:${NOVNC_PORT}" "127.0.0.1:${VNC_PORT}" &
 NOVNC_PID=$!
 
+set +e
 wait -n "$XVFB_PID" "$DESKTOP_PID" "$VNC_PID" "$NOVNC_PID"
 status=$?
+set -e
 echo "CloudPC: a core process exited (status ${status}); stopping container."
 exit "$status"
