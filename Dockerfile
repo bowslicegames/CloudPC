@@ -35,7 +35,6 @@ RUN printf '%s\n' \
  && mkdir -p /tmp/.X11-unix /data /opt/cloudpc \
  && chown root:root /tmp/.X11-unix \
  && chmod 1777 /tmp/.X11-unix \
-
  && chown -R cloud:cloud /home/cloud /data
 
 COPY entrypoint.sh /opt/cloudpc/entrypoint.sh
