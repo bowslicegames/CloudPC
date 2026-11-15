@@ -37,18 +37,29 @@ fi
 chown -h cloud:cloud /home/cloud/.minecraft /home/cloud/.local \
   /home/cloud/.config /home/cloud/Desktop /home/cloud/Downloads
 
-# Generate a persistent VNC password on first boot. It is printed once so the
-# owner can retrieve it from the container logs, and then retained in /data.
+# Classic VNC password authentication uses at most 8 characters. Keep the
+# generated password exactly 8 chars so users can enter the whole value.
+# VNC_PASSWORD explicitly supplied by the deployment takes precedence on each boot.
 if [[ -n "${VNC_PASSWORD:-}" ]]; then
-  printf '%s\n' "$VNC_PASSWORD" | x11vnc -storepasswd - /data/.vnc/passwd >/dev/null
+  VNC_PASSWORD="${VNC_PASSWORD:0:8}"
+  if [[ ${#VNC_PASSWORD} -lt 6 ]]; then
+    echo "ERROR: VNC_PASSWORD must contain at least 6 characters."
+    exit 1
+  fi
+  printf '%s\\n' "$VNC_PASSWORD" | x11vnc -storepasswd - /data/.vnc/passwd >/dev/null
   chmod 600 /data/.vnc/passwd
+  chown cloud:cloud /data/.vnc/passwd
+  echo "CloudPC: VNC password configured from deployment environment (first 8 characters used)."
 elif [[ ! -s /data/.vnc/passwd ]]; then
-  VNC_PASSWORD="$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')"
-  printf '%s\n' "$VNC_PASSWORD" | x11vnc -storepasswd - /data/.vnc/passwd >/dev/null
+  VNC_PASSWORD="$(od -An -N4 -tx1 /dev/urandom | tr -d ' \\n')"
+  printf '%s\\n' "$VNC_PASSWORD" | x11vnc -storepasswd - /data/.vnc/passwd >/dev/null
   chmod 600 /data/.vnc/passwd
+  chown cloud:cloud /data/.vnc/passwd
   echo "CLOUDPC_FIRST_BOOT_VNC_PASSWORD=${VNC_PASSWORD}"
 else
-  echo "CloudPC: using the VNC password already stored in /data/.vnc/passwd"
+  chmod 600 /data/.vnc/passwd
+  chown cloud:cloud /data/.vnc/passwd
+  echo "CloudPC: reusing persistent VNC password file; set VNC_PASSWORD in Altare to reset it."
 fi
 
 # Sensible low-memory Java defaults; users can change these in Prism settings.
