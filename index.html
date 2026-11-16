@@ -3,34 +3,73 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
-<meta name="theme-color" content="#111827">
-<title>CloudPC</title>
+<meta name="theme-color" content="#101827">
+<title>CloudPC Login</title>
 <style>
-:root{color-scheme:dark;font-family:system-ui,-apple-system,Segoe UI,sans-serif}
-*{box-sizing:border-box}body{margin:0;min-height:100vh;background:radial-gradient(ellipse at 20% 0,#243b63,#101827 55%);color:#f8fafc;display:grid;place-items:center;padding:24px}
-main{width:min(720px,100%);background:#111c2dcc;border:1px solid #52627a66;border-radius:22px;padding:clamp(24px,5vw,44px);box-shadow:0 24px 90px #0008}
-.mark{font-size:13px;letter-spacing:.16em;text-transform:uppercase;color:#9db6db;font-weight:700}
-h1{font-size:clamp(36px,7vw,58px);margin:12px 0 8px;letter-spacing:-.05em}
-p{color:#bdc9da;line-height:1.65}
-a.button{display:inline-flex;margin:20px 0 10px;padding:14px 22px;border-radius:12px;background:#78a9ff;color:#081326;text-decoration:none;font-weight:800}
-.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px;margin-top:24px}
-article{padding:16px;border:1px solid #ffffff18;border-radius:14px;background:#ffffff08}
-article b{display:block;margin-bottom:5px}small{color:#9eacc0}
-footer{margin-top:26px;color:#8190a6;font-size:12px}
+:root{color-scheme:dark;font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
+*{box-sizing:border-box}body{margin:0;min-height:100vh;background:radial-gradient(ellipse at 20% 0,#243b63,#101827 58%);color:#f8fafc;display:grid;place-items:center;padding:18px}
+#login{width:min(440px,100%);background:#111c2df2;border:1px solid #52627a88;border-radius:20px;padding:clamp(24px,6vw,38px);box-shadow:0 24px 90px #0008}
+.mark{font-size:12px;letter-spacing:.16em;text-transform:uppercase;color:#9db6db;font-weight:750}
+h1{font-size:38px;margin:10px 0 6px;letter-spacing:-.05em}p{color:#bdc9da;line-height:1.55}
+label{display:block;font-size:14px;font-weight:650;margin:22px 0 8px}
+input{width:100%;font:inherit;font-size:18px;letter-spacing:.12em;padding:14px;border-radius:11px;border:1px solid #52627a;background:#0b1422;color:white;outline:none}
+input:focus{border-color:#78a9ff;box-shadow:0 0 0 3px #78a9ff33}
+button{width:100%;margin-top:14px;padding:14px;border:0;border-radius:11px;background:#78a9ff;color:#081326;font:inherit;font-weight:800;cursor:pointer}
+button:disabled{opacity:.6;cursor:wait}
+#message{min-height:24px;margin:12px 0 0;font-size:14px;color:#ffb4a9}
+.hint{font-size:12px;color:#93a4bc;margin-top:16px}
+#desktop{display:none;position:fixed;inset:0;background:#080d16}
+#toolbar{height:48px;display:flex;align-items:center;justify-content:space-between;padding:0 14px;background:#111c2d;color:#dbeafe;font-size:14px}
+#screen{height:calc(100% - 48px);width:100%;display:flex;align-items:center;justify-content:center;overflow:auto}
+#screen canvas{max-width:100%;max-height:100%}
+#disconnect{width:auto;margin:0;padding:7px 12px;font-size:13px}
 </style>
 </head>
 <body>
-<main>
+<section id="login">
   <div class="mark">Your private cloud desktop</div>
   <h1>CloudPC</h1>
-  <p>A lightweight Linux desktop with Prism Launcher and Java 21. Connect using the VNC password shown in your Altare container's first-start logs.</p>
-  <a class="button" href="/vnc.html?autoconnect=true&resize=remote&quality=6&compression=2">Open desktop ↗</a>
-  <div class="grid">
-    <article><b>XFCE desktop</b><small>Lightweight Linux GUI</small></article>
-    <article><b>Prism Launcher</b><small>Multiple Minecraft instances</small></article>
-    <article><b>Persistent data</b><small>Keep /data mounted between redeploys</small></article>
-  </div>
-  <footer>CloudPC is an independent community project. Minecraft and Prism Launcher are not affiliated with Altare.</footer>
-</main>
+  <p>Enter your CloudPC VNC password to connect to your desktop.</p>
+  <form id="form">
+    <label for="password">Desktop password</label>
+    <input id="password" type="password" autocomplete="current-password" autocapitalize="off" spellcheck="false" required minlength="6" maxlength="8" placeholder="6–8 characters">
+    <button id="connect" type="submit">Connect to desktop</button>
+    <div id="message" role="status" aria-live="polite"></div>
+  </form>
+  <div class="hint">VNC passwords use a maximum of 8 characters. Your password is sent directly to the VNC connection and is not put in the page URL.</div>
+</section>
+<section id="desktop">
+  <div id="toolbar"><span>CloudPC desktop</span><button id="disconnect" type="button">Disconnect</button></div>
+  <div id="screen"></div>
+</section>
+<script type="module">
+import RFB from "/core/rfb.js";
+const form=document.querySelector("#form");
+const password=document.querySelector("#password");
+const button=document.querySelector("#connect");
+const message=document.querySelector("#message");
+const login=document.querySelector("#login");
+const desktop=document.querySelector("#desktop");
+const screen=document.querySelector("#screen");
+let rfb=null;
+function showLogin(text=""){message.textContent=text;login.style.display="block";desktop.style.display="none";button.disabled=false;button.textContent="Connect to desktop";password.focus();}
+function disconnect(){if(rfb){const old=rfb;rfb=null;try{old.disconnect()}catch{}}screen.replaceChildren();showLogin();}
+document.querySelector("#disconnect").addEventListener("click",disconnect);
+form.addEventListener("submit",async event=>{
+  event.preventDefault();
+  const secret=password.value.slice(0,8);
+  if(secret.length<6){showLogin("Enter the 6–8 character VNC password.");return;}
+  button.disabled=true;button.textContent="Connecting…";message.textContent="Connecting to CloudPC…";
+  try{
+    const scheme=location.protocol==="https:"?"wss":"ws";
+    rfb=new RFB(screen,scheme+"://"+location.host+"/websockify",{credentials:{password:secret}});
+    rfb.scaleViewport=true;rfb.resizeSession=false;rfb.showDotCursor=true;
+    rfb.addEventListener("connect",()=>{login.style.display="none";desktop.style.display="block";message.textContent="";button.disabled=false;});
+    rfb.addEventListener("credentialsrequired",()=>{try{rfb.sendCredentials({password:secret});}catch(e){showLogin("The VNC server rejected the password.");}});
+    rfb.addEventListener("securityfailure",event=>{const reason=event.detail?.reason||"Authentication failed.";rfb=null;screen.replaceChildren();showLogin("Login failed: "+reason+" Check the password and try again.");});
+    rfb.addEventListener("disconnect",event=>{if(!event.detail?.clean){rfb=null;screen.replaceChildren();showLogin("Connection lost. Check that CloudPC is running, then try again.");}else if(rfb){rfb=null;screen.replaceChildren();showLogin("Disconnected.");}});
+  }catch(error){rfb=null;screen.replaceChildren();showLogin("Could not connect: "+(error?.message||"unknown error"));}
+});
+</script>
 </body>
 </html>
