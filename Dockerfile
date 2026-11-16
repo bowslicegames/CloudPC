@@ -41,7 +41,8 @@ COPY entrypoint.sh /opt/cloudpc/entrypoint.sh
 COPY healthcheck.sh /opt/cloudpc/healthcheck.sh
 COPY index.html /usr/share/novnc/index.html
 
-RUN chmod +x /opt/cloudpc/entrypoint.sh /opt/cloudpc/healthcheck.sh \\\n && rm -f /usr/share/novnc/vnc.html /usr/share/novnc/vnc_lite.html
+RUN chmod +x /opt/cloudpc/entrypoint.sh /opt/cloudpc/healthcheck.sh \\
+ && rm -f /usr/share/novnc/vnc.html /usr/share/novnc/vnc_lite.html
 
 EXPOSE 8080
 VOLUME ["/data"]
