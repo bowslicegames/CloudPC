@@ -46,13 +46,13 @@ if [[ -n "${VNC_PASSWORD:-}" ]]; then
     echo "ERROR: VNC_PASSWORD must contain at least 6 characters."
     exit 1
   fi
-  printf '%s\\n' "$VNC_PASSWORD" | x11vnc -storepasswd - /data/.vnc/passwd >/dev/null
+  printf '%s\n' "$VNC_PASSWORD" | x11vnc -storepasswd - /data/.vnc/passwd >/dev/null
   chmod 600 /data/.vnc/passwd
   chown cloud:cloud /data/.vnc/passwd
   echo "CloudPC: VNC password configured from deployment environment (first 8 characters used)."
 elif [[ ! -s /data/.vnc/passwd ]]; then
-  VNC_PASSWORD="$(od -An -N4 -tx1 /dev/urandom | tr -d ' \\n')"
-  printf '%s\\n' "$VNC_PASSWORD" | x11vnc -storepasswd - /data/.vnc/passwd >/dev/null
+  VNC_PASSWORD="$(od -An -N4 -tx1 /dev/urandom | tr -d ' \n')"
+  printf '%s\n' "$VNC_PASSWORD" | x11vnc -storepasswd - /data/.vnc/passwd >/dev/null
   chmod 600 /data/.vnc/passwd
   chown cloud:cloud /data/.vnc/passwd
   echo "CLOUDPC_FIRST_BOOT_VNC_PASSWORD=${VNC_PASSWORD}"
