@@ -13,46 +13,36 @@ mkdir -p /data/.vnc /data/.minecraft /data/.local/share/PrismLauncher \
          /data/.config /data/Desktop /data/Downloads
 chown -R cloud:cloud /data
 
-# Keep Minecraft and Prism data on the persistent mount, not the container layer.
-if [[ ! -L /home/cloud/.minecraft ]]; then
-  rm -rf /home/cloud/.minecraft
-  ln -s /data/.minecraft /home/cloud/.minecraft
-fi
-if [[ ! -L /home/cloud/.local ]]; then
-  rm -rf /home/cloud/.local
-  ln -s /data/.local /home/cloud/.local
-fi
-if [[ ! -L /home/cloud/.config ]]; then
-  rm -rf /home/cloud/.config
-  ln -s /data/.config /home/cloud/.config
-fi
-if [[ ! -L /home/cloud/Desktop ]]; then
-  rm -rf /home/cloud/Desktop
-  ln -s /data/Desktop /home/cloud/Desktop
-fi
-if [[ ! -L /home/cloud/Downloads ]]; then
-  rm -rf /home/cloud/Downloads
-  ln -s /data/Downloads /home/cloud/Downloads
-fi
+# Keep user data on the persistent /data mount.
+for item in .minecraft .local .config Desktop Downloads; do
+  if [[ ! -L "/home/cloud/$item" ]]; then
+    rm -rf "/home/cloud/$item"
+    ln -s "/data/$item" "/home/cloud/$item"
+  fi
+done
 chown -h cloud:cloud /home/cloud/.minecraft /home/cloud/.local \
   /home/cloud/.config /home/cloud/Desktop /home/cloud/Downloads
 
-# VNC authentication is intentionally disabled. The desktop is accessible to
-# anyone who can reach the published noVNC endpoint; protect it with a private
-# network, VPN, or an authenticated reverse proxy if it is internet-facing.
 echo "CloudPC: VNC password authentication is DISABLED."
 
-# Sensible low-memory Java defaults; users can change these in Prism settings.
-mkdir -p /data/.config
 cat > /data/.config/cloudpc-env <<EOF
 JAVA_MIN_RAM=${JAVA_MIN_RAM}
 JAVA_MAX_RAM=${JAVA_MAX_RAM}
 EOF
 chown cloud:cloud /data/.config/cloudpc-env
 
+XVFB_PID=""
+DESKTOP_PID=""
+VNC_PID=""
+NOVNC_PID=""
 cleanup() {
-  kill "${NOVNC_PID:-}" "${VNC_PID:-}" "${DESKTOP_PID:-}" "${XVFB_PID:-}" 2>/dev/null || true
-  wait || true
+  trap - EXIT INT TERM
+  for pid in "$NOVNC_PID" "$VNC_PID" "$DESKTOP_PID" "$XVFB_PID"; do
+    if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+      kill "$pid" 2>/dev/null || true
+    fi
+  done
+  wait 2>/dev/null || true
 }
 trap cleanup EXIT INT TERM
 
@@ -72,9 +62,9 @@ XVFB_PID=$!
 DISPLAY_READY=0
 for _ in $(seq 1 60); do
   if ! kill -0 "$XVFB_PID" 2>/dev/null; then
-    echo "ERROR: Xvfb process exited during startup."
+    echo "ERROR: Xvfb exited during startup."
     wait "$XVFB_PID" || true
-    break
+    exit 1
   fi
   if xdpyinfo -display :0 >/dev/null 2>&1; then
     DISPLAY_READY=1
@@ -83,11 +73,7 @@ for _ in $(seq 1 60); do
   sleep 0.5
 done
 if [[ "$DISPLAY_READY" != "1" ]]; then
-  echo "ERROR: Xvfb did not become ready. Diagnostics:"
-  command -v Xvfb || true
-  command -v xdpyinfo || true
-  ls -ld /tmp /tmp/.X11-unix || true
-  ls -la /tmp/.X11-unix || true
+  echo "ERROR: Xvfb did not become ready."
   ps aux | grep '[X]vfb' || true
   exit 1
 fi
@@ -98,23 +84,67 @@ runuser -u cloud -- env HOME=/home/cloud DISPLAY=:0 \
 DESKTOP_PID=$!
 
 echo "CloudPC: starting password-free VNC server..."
+# Keep x11vnc output visible: startup failures must be diagnosable in Altare.
 runuser -u cloud -- env HOME=/home/cloud DISPLAY=:0 \
   x11vnc -display :0 -nopw -rfbport "${VNC_PORT}" \
-  -forever -shared -noxdamage -repeat -localhost -quiet &
+  -forever -shared -noxdamage -repeat -localhost &
 VNC_PID=$!
 
+VNC_READY=0
 for _ in $(seq 1 40); do
-  if (echo >/dev/tcp/127.0.0.1/"${VNC_PORT}") >/dev/null 2>&1; then break; fi
+  if ! kill -0 "$VNC_PID" 2>/dev/null; then
+    echo "ERROR: x11vnc exited before opening port ${VNC_PORT}."
+    wait "$VNC_PID" || true
+    exit 1
+  fi
+  if (echo >/dev/tcp/127.0.0.1/"${VNC_PORT}") >/dev/null 2>&1; then
+    VNC_READY=1
+    break
+  fi
   sleep 0.5
 done
+if [[ "$VNC_READY" != "1" ]]; then
+  echo "ERROR: x11vnc did not listen on 127.0.0.1:${VNC_PORT}."
+  ps aux | grep '[x]11vnc' || true
+  exit 1
+fi
 
-echo "CloudPC: serving noVNC on 0.0.0.0:${NOVNC_PORT}"
+echo "CloudPC: starting noVNC/websockify on 0.0.0.0:${NOVNC_PORT}..."
 websockify --web=/usr/share/novnc "0.0.0.0:${NOVNC_PORT}" "127.0.0.1:${VNC_PORT}" &
 NOVNC_PID=$!
 
+NOVNC_READY=0
+for _ in $(seq 1 40); do
+  if ! kill -0 "$NOVNC_PID" 2>/dev/null; then
+    echo "ERROR: websockify exited during startup."
+    wait "$NOVNC_PID" || true
+    exit 1
+  fi
+  if (echo >/dev/tcp/127.0.0.1/"${NOVNC_PORT}") >/dev/null 2>&1; then
+    NOVNC_READY=1
+    break
+  fi
+  sleep 0.5
+done
+if [[ "$NOVNC_READY" != "1" ]]; then
+  echo "ERROR: websockify did not listen on 127.0.0.1:${NOVNC_PORT}."
+  ps aux | grep '[w]ebsockify' || true
+  exit 1
+fi
+
+echo "CloudPC: noVNC is listening on port ${NOVNC_PORT}; password authentication is disabled."
+
+# Supervise all core services. If one exits, report which one before shutdown.
 set +e
 wait -n "$XVFB_PID" "$DESKTOP_PID" "$VNC_PID" "$NOVNC_PID"
 status=$?
 set -e
-echo "CloudPC: a core process exited (status ${status}); stopping container."
+for name in XVFB DESKTOP VNC NOVNC; do
+  pidvar="${name}_PID"
+  pid="${!pidvar}"
+  if [[ -n "$pid" ]] && ! kill -0 "$pid" 2>/dev/null; then
+    echo "ERROR: CloudPC core process $name (PID $pid) exited."
+  fi
+done
+echo "CloudPC: a core process exited (status $status); stopping container."
 exit "$status"
