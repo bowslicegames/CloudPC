@@ -37,30 +37,10 @@ fi
 chown -h cloud:cloud /home/cloud/.minecraft /home/cloud/.local \
   /home/cloud/.config /home/cloud/Desktop /home/cloud/Downloads
 
-# Classic VNC password authentication uses at most 8 characters. Keep the
-# generated password exactly 8 chars so users can enter the whole value.
-# VNC_PASSWORD explicitly supplied by the deployment takes precedence on each boot.
-if [[ -n "${VNC_PASSWORD:-}" ]]; then
-  VNC_PASSWORD="${VNC_PASSWORD:0:8}"
-  if [[ ${#VNC_PASSWORD} -lt 6 ]]; then
-    echo "ERROR: VNC_PASSWORD must contain at least 6 characters."
-    exit 1
-  fi
-  printf '%s\n' "$VNC_PASSWORD" | x11vnc -storepasswd - /data/.vnc/passwd >/dev/null
-  chmod 600 /data/.vnc/passwd
-  chown cloud:cloud /data/.vnc/passwd
-  echo "CloudPC: VNC password configured from deployment environment (first 8 characters used)."
-elif [[ ! -s /data/.vnc/passwd ]]; then
-  VNC_PASSWORD="$(od -An -N4 -tx1 /dev/urandom | tr -d ' \n')"
-  printf '%s\n' "$VNC_PASSWORD" | x11vnc -storepasswd - /data/.vnc/passwd >/dev/null
-  chmod 600 /data/.vnc/passwd
-  chown cloud:cloud /data/.vnc/passwd
-  echo "CLOUDPC_FIRST_BOOT_VNC_PASSWORD=${VNC_PASSWORD}"
-else
-  chmod 600 /data/.vnc/passwd
-  chown cloud:cloud /data/.vnc/passwd
-  echo "CloudPC: reusing persistent VNC password file; set VNC_PASSWORD in Altare to reset it."
-fi
+# VNC authentication is intentionally disabled. The desktop is accessible to
+# anyone who can reach the published noVNC endpoint; protect it with a private
+# network, VPN, or an authenticated reverse proxy if it is internet-facing.
+echo "CloudPC: VNC password authentication is DISABLED."
 
 # Sensible low-memory Java defaults; users can change these in Prism settings.
 mkdir -p /data/.config
@@ -117,11 +97,10 @@ runuser -u cloud -- env HOME=/home/cloud DISPLAY=:0 \
   dbus-run-session -- startxfce4 &
 DESKTOP_PID=$!
 
-echo "CloudPC: starting authenticated VNC server..."
+echo "CloudPC: starting password-free VNC server..."
 runuser -u cloud -- env HOME=/home/cloud DISPLAY=:0 \
-  x11vnc -display :0 -rfbauth /data/.vnc/passwd \
-  -rfbport "${VNC_PORT}" -forever -shared -noxdamage -repeat \
-  -localhost -quiet &
+  x11vnc -display :0 -nopw -rfbport "${VNC_PORT}" \
+  -forever -shared -noxdamage -repeat -localhost -quiet &
 VNC_PID=$!
 
 for _ in $(seq 1 40); do
