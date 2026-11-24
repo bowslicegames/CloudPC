@@ -81,6 +81,12 @@ button[aria-pressed="true"],button.primary{background:var(--accent);color:var(--
   background:rgba(120,169,255,.10);color:#cfe0ff;display:flex;align-items:center;justify-content:center;
   font-size:12px;line-height:1.35;text-align:center;padding:8px;
 }
+#controls .lookcol{display:grid;gap:6px;min-width:0}
+#controls .lookspeed{
+  pointer-events:auto;display:flex;align-items:center;gap:8px;margin:0;padding:0 4px;
+  font-size:11px;color:#cfe0ff;white-space:nowrap;
+}
+#controls .lookspeed input{pointer-events:auto;flex:1 1 auto;min-width:0;height:26px;margin:0;accent-color:var(--accent);touch-action:manipulation}
 #controls .actions{display:grid;grid-template-columns:repeat(2,minmax(76px,1fr));gap:6px}
 #controls .actions button{min-height:var(--action);border-radius:14px;background:rgba(34,48,74,.74);font-size:12.5px;padding:0 8px;backdrop-filter:blur(6px)}
 #controls button[data-active="1"],#trackpad button[data-active="1"]{background:var(--accent);color:var(--accent-ink)}
@@ -142,7 +148,10 @@ button[aria-pressed="true"],button.primary{background:var(--accent);color:var(--
       <button type="button" data-key="KeyS">S</button>
       <button type="button" data-key="KeyD">D</button>
     </div>
-    <div class="lookpad" id="lookpad">Drag to look<br>Tap to click</div>
+    <div class="lookcol">
+      <div class="lookpad" id="lookpad">Drag to look<br>Tap to click</div>
+      <label class="lookspeed">Look speed<input id="lookSpeed" type="range" min="0.1" max="1.6" step="0.05" value="0.45" aria-label="Look speed"></label>
+    </div>
     <div class="actions">
       <button type="button" data-key="Space">Jump</button>
       <button type="button" data-key="ShiftLeft">Sneak</button>
@@ -539,7 +548,32 @@ for (const button of controlsEl.querySelectorAll("button[data-key]")) {
   button.addEventListener("lostpointercapture", release);
 }
 
-const LOOK_GAIN = 1.6;
+/* Look speed is measured in screen pixels per CSS pixel of travel, so it means the
+ * same on a phone and on a desktop browser no matter how far the 1280 px desktop is
+ * scaled down. 1.0 follows the finger exactly; the default is slower on purpose
+ * because Minecraft applies its own mouse sensitivity on top. */
+const lookSpeed = document.querySelector("#lookSpeed");
+const LOOK_SPEED_KEY = "cloudpc.lookSpeed";
+let lookGain = 0.45;
+try {
+  const stored = Number(localStorage.getItem(LOOK_SPEED_KEY));
+  if (Number.isFinite(stored) && stored >= 0.1 && stored <= 1.6) lookGain = stored;
+} catch {
+  /* storage can be blocked; the default stands */
+}
+lookSpeed.value = String(lookGain);
+lookSpeed.addEventListener("input", () => {
+  const value = Number(lookSpeed.value);
+  if (!Number.isFinite(value)) return;
+  lookGain = value;
+  try { localStorage.setItem(LOOK_SPEED_KEY, String(value)); } catch { /* ignore */ }
+});
+
+function remotePixelsPerCssPixel() {
+  if (!canvas || !canvas.clientWidth) return 1;
+  return canvas.width / canvas.clientWidth || 1;
+}
+
 let look = null;
 
 lookpad.addEventListener("pointerdown", event => {
@@ -556,7 +590,8 @@ lookpad.addEventListener("pointermove", event => {
   look.x = event.clientX;
   look.y = event.clientY;
   look.moved += Math.abs(dx) + Math.abs(dy);
-  moveCursorBy(dx * LOOK_GAIN, dy * LOOK_GAIN);
+  const gain = lookGain * remotePixelsPerCssPixel();
+  moveCursorBy(dx * gain, dy * gain);
 });
 
 function endLook(event) {

@@ -16,7 +16,7 @@ A browser-accessible, lightweight Debian desktop intended for an Altare Docker A
 - Persistent launcher configuration, accounts, instances, worlds, downloads and desktop files under `/data`
 - 1280×800 desktop with larger fonts and cursor for small screens
 - Conservative Java defaults (512 MiB initial, 1.5 GiB maximum)
-- Minecraft instance preconfigured for software rendering: 960×540 window, 4 chunk render distance, fast graphics, no clouds or entity shadows
+- Minecraft instance preconfigured for software rendering: 800×450 window, 2.5 GiB heap, 4 chunk render distance, fast graphics, no clouds or entity shadows
 - Docker health check and GitHub Actions image-build workflow
 
 ## Build locally
@@ -69,7 +69,7 @@ The instance ships as a descriptor only: Prism Launcher downloads that Minecraft
   - The buttons along the bottom give Left click, Right click, Scroll up, Scroll down, Alt+Tab, Alt+F4 and Menu (Super).
   - While it is on it captures touches, so toggle it off to tap the desktop directly.
 - **🎮** toggles the game overlay. Left side is W/A/S/D; the right side has Jump, Sneak, Sprint, Use (right click), Inventory, Drop, Esc and Chat, all as press-and-hold buttons.
-- The **Look** pad between them drags the pointer for camera movement (once Minecraft has captured the cursor this reads as mouse look) and a tap is a left click.
+- The **Look** pad between them drags the pointer for camera movement (once Minecraft has captured the cursor this reads as mouse look) and a tap is a left click. The **Look speed** slider under it sets how far the pointer travels per pixel of finger movement: `1.0` follows your finger exactly, the default `0.45` is slower because Minecraft applies its own mouse sensitivity on top. The value is remembered per browser, so tune it on the device you play on.
 - **⛶** toggles fullscreen. The toolbar and overlay respect phone safe areas.
 - The desktop defaults to 1280×800 with 120 DPI fonts and a 24 px cursor for touch targets; override with `SCREEN_WIDTH` / `SCREEN_HEIGHT`. Window compositing is off because rendering is CPU-based.
 
@@ -89,7 +89,7 @@ What CloudPC already does for you:
 
 - `LP_NUM_THREADS` is derived from the container's CPU quota, so llvmpipe uses the cores the app is actually allowed instead of spawning a worker per host core and thrashing.
 - The Mesa shader cache lives in `/data/.cache/mesa`, so shaders compiled by the LLVM JIT survive restarts.
-- The seeded instance opens in a 960×540 window (`instance.cfg`), roughly half the pixels of the 1280×800 desktop.
+- The seeded instance opens in an 800×450 window (`instance.cfg`), a third of the pixels of the 1280×800 desktop, with a 2.5 GiB heap because 1.21.x plus mods thrashes a 1.5 GiB heap.
 - A fresh instance starts at render distance 4, simulation distance 5, fast graphics, smooth lighting off, no clouds, no entity shadows, minimal particles and vsync off.
 - Minecraft is forced out of fullscreen on start. The browser already scales the desktop to the device, and fullscreen is the most expensive case for a CPU rasteriser.
 

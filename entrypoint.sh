@@ -88,6 +88,22 @@ INSTANCE_OPTIONS="$INSTANCE_DIR/options.txt"
 if [[ -f "$INSTANCE_OPTIONS" ]]; then
   sed -i 's/^fullscreen:true$/fullscreen:false/' "$INSTANCE_OPTIONS"
 fi
+
+# Move earlier presets forward. Each key is only rewritten while it still holds
+# exactly the value we shipped, so anything the user picked in Prism is kept.
+set_instance_default() {
+  local key="$1" from="$2" to="$3"
+  if grep -qx "${key}=${from}" "$INSTANCE_CFG"; then
+    sed -i "s/^${key}=${from}\$/${key}=${to}/" "$INSTANCE_CFG"
+    echo "CloudPC: instance default ${key} ${from} -> ${to}"
+  fi
+}
+# 1.21.x with mods needs more heap than 1.5 GiB; a smaller window is cheaper to
+# render on llvmpipe because every pixel is shaded on the CPU.
+set_instance_default MinMemAlloc 512 1024
+set_instance_default MaxMemAlloc 1536 2560
+set_instance_default MinecraftWinWidth 960 800
+set_instance_default MinecraftWinHeight 540 450
 if [[ ! -f "/data/Desktop/Prism Launcher.desktop" ]]; then
   cp /opt/cloudpc/prism/PrismLauncher.desktop "/data/Desktop/Prism Launcher.desktop"
 fi
