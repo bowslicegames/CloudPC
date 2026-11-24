@@ -10,7 +10,7 @@ A browser-accessible, lightweight Debian desktop intended for an Altare Docker A
 - XFCE desktop, Thunar file manager and terminal
 - noVNC browser access with a phone- and tablet-friendly client
 - VNC password authentication from the `VNC_PASSWORD` environment variable
-- Touch controls: on-screen keyboard, fullscreen, and a game overlay (W/A/S/D, jump, sneak, sprint, use, inventory, drop, chat and a look/tap pad)
+- Touch controls: on-screen keyboard, a trackpad overlay that replaces the mouse for the whole desktop, and a game overlay (W/A/S/D, jump, sneak, sprint, use, inventory, drop, chat and a look/tap pad)
 - Prism Launcher from Debian trixie-backports, preinstalled with a ready-to-run Minecraft instance and a one-tap desktop shortcut
 - OpenJDK 21 runtime
 - Persistent launcher configuration, accounts, instances, worlds, downloads and desktop files under `/data`
@@ -60,6 +60,13 @@ The instance ships as a descriptor only: Prism Launcher downloads that Minecraft
 ## Mobile and touch use
 
 - **⌨** opens the on-screen keyboard: tap it, then type into the desktop. Printable characters, Enter, Backspace, Tab, Escape, arrows and F-keys are forwarded.
+- **🖱** toggles the **trackpad overlay**, which removes the need for a mouse anywhere in the desktop:
+  - drag anywhere to move the cursor (movement speeds up with fast swipes),
+  - tap for a left click, two-finger tap for a right click,
+  - hold for about half a second, then drag, to drag windows or select text,
+  - two-finger drag to scroll.
+  - The buttons along the bottom give Left click, Right click, Scroll up, Scroll down, Alt+Tab, Alt+F4 and Menu (Super).
+  - While it is on it captures touches, so toggle it off to tap the desktop directly.
 - **🎮** toggles the game overlay. Left side is W/A/S/D; the right side has Jump, Sneak, Sprint, Use (right click), Inventory, Drop, Esc and Chat, all as press-and-hold buttons.
 - The **Look** pad between them drags the pointer for camera movement (once Minecraft has captured the cursor this reads as mouse look) and a tap is a left click.
 - **⛶** toggles fullscreen. The toolbar and overlay respect phone safe areas.

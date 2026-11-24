@@ -28,7 +28,7 @@ body{display:flex;flex-direction:column;-webkit-tap-highlight-color:transparent;
   padding:calc(6px + env(safe-area-inset-top)) 10px 6px;background:var(--bar);color:var(--bar-text);font-size:14px;
 }
 #toolbar strong{font-size:15px;letter-spacing:.02em}
-#status{flex:1 1 120px;min-width:0;color:#bdc9da;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+#status{flex:1 1 110px;min-width:0;color:#bdc9da;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 #toolbar .buttons{display:flex;gap:6px;margin-left:auto}
 button{
   min-width:48px;min-height:48px;padding:0 12px;border:0;border-radius:12px;background:#22304a;color:#e6eefc;
@@ -36,10 +36,35 @@ button{
 }
 button[aria-pressed="true"],button.primary{background:var(--accent);color:var(--accent-ink)}
 #reconnect{display:none}
+#stage{position:relative;flex:1 1 auto;min-height:0;display:flex}
 #screen{position:relative;flex:1 1 auto;display:flex;align-items:center;justify-content:center;overflow:hidden;background:#000}
 #screen canvas{max-width:100%;max-height:100%;touch-action:none}
+
+/* ---------- trackpad overlay (whole desktop) ---------- */
+#trackpad{
+  position:absolute;inset:0;z-index:25;display:flex;flex-direction:column;justify-content:flex-end;gap:10px;
+  padding:10px calc(10px + env(safe-area-inset-right)) calc(10px + env(safe-area-inset-bottom)) calc(10px + env(safe-area-inset-left));
+  touch-action:none;
+}
+#trackpad[hidden]{display:none}
+#trackpad .hint{
+  align-self:center;margin:0;padding:6px 12px;border-radius:999px;font-size:11.5px;line-height:1.4;text-align:center;
+  color:#d7e4ff;background:rgba(8,13,22,.66);backdrop-filter:blur(6px);pointer-events:none;
+}
+#trackpad .strip{display:flex;flex-wrap:wrap;gap:6px;justify-content:center}
+#trackpad .strip button{
+  min-width:0;min-height:44px;padding:0 12px;border-radius:12px;font-size:12.5px;
+  background:rgba(34,48,74,.82);backdrop-filter:blur(6px);
+}
+#trackpad .clicks{display:flex;gap:10px;justify-content:space-between}
+#trackpad .clicks button{
+  flex:1 1 0;min-height:60px;border-radius:18px;font-size:15px;
+  background:rgba(34,48,74,.82);backdrop-filter:blur(6px);
+}
+
+/* ---------- game overlay ---------- */
 #controls{
-  position:fixed;left:0;right:0;bottom:0;z-index:20;display:grid;
+  position:absolute;left:0;right:0;bottom:0;z-index:25;display:grid;
   grid-template-columns:auto minmax(0,1fr) auto;align-items:end;gap:8px;
   padding:0 10px calc(10px + env(safe-area-inset-bottom)) 10px;pointer-events:none;
 }
@@ -58,7 +83,9 @@ button[aria-pressed="true"],button.primary{background:var(--accent);color:var(--
 }
 #controls .actions{display:grid;grid-template-columns:repeat(2,minmax(76px,1fr));gap:6px}
 #controls .actions button{min-height:var(--action);border-radius:14px;background:rgba(34,48,74,.74);font-size:12.5px;padding:0 8px;backdrop-filter:blur(6px)}
-#controls button[data-active="1"]{background:var(--accent);color:var(--accent-ink)}
+#controls button[data-active="1"],#trackpad button[data-active="1"]{background:var(--accent);color:var(--accent-ink)}
+
+/* ---------- password prompt ---------- */
 #passwordPrompt{position:fixed;inset:0;z-index:40;display:grid;place-items:center;padding:20px;background:rgba(8,13,22,.84)}
 #passwordPrompt[hidden]{display:none}
 #passwordPrompt form{width:min(380px,100%);display:grid;gap:12px;padding:20px;border-radius:18px;background:#111c2d;box-shadow:0 20px 44px rgba(0,0,0,.5)}
@@ -71,6 +98,8 @@ button[aria-pressed="true"],button.primary{background:var(--accent);color:var(--
   :root{--pad:52px;--action:44px}
   #toolbar{font-size:13px}
   #toolbar strong{display:none}
+  #trackpad .hint{font-size:11px}
+  #trackpad .strip button{font-size:12px;padding:0 10px}
   #controls .lookpad{font-size:11px}
 }
 </style>
@@ -81,31 +110,49 @@ button[aria-pressed="true"],button.primary{background:var(--accent);color:var(--
   <span id="status">Connecting to desktop…</span>
   <div class="buttons">
     <button id="keyboardBtn" type="button" title="On-screen keyboard" aria-label="On-screen keyboard">⌨</button>
-    <button id="controlsBtn" type="button" title="Touch controls" aria-label="Touch controls" aria-pressed="false">🎮</button>
+    <button id="trackpadBtn" type="button" title="Trackpad (touch pointer)" aria-label="Trackpad" aria-pressed="false">🖱</button>
+    <button id="controlsBtn" type="button" title="Game controls" aria-label="Game controls" aria-pressed="false">🎮</button>
     <button id="fullscreenBtn" type="button" title="Fullscreen" aria-label="Fullscreen">⛶</button>
     <button id="reconnect" class="primary" type="button">Reconnect</button>
   </div>
 </header>
 
-<div id="screen"></div>
+<div id="stage">
+  <div id="screen"></div>
 
-<div id="controls" hidden>
-  <div class="pad">
-    <button type="button" data-key="KeyW">W</button>
-    <button type="button" data-key="KeyA">A</button>
-    <button type="button" data-key="KeyS">S</button>
-    <button type="button" data-key="KeyD">D</button>
+  <div id="trackpad" hidden>
+    <p class="hint">Drag to move the cursor · tap = click · hold = drag · two-finger tap = right click · two-finger drag = scroll</p>
+    <div class="strip">
+      <button type="button" data-scroll="-60">▲ Scroll up</button>
+      <button type="button" data-scroll="60">▼ Scroll down</button>
+      <button type="button" data-combo="alt-tab">Alt+Tab</button>
+      <button type="button" data-combo="alt-f4">Alt+F4</button>
+      <button type="button" data-key="Super_L">Menu</button>
+    </div>
+    <div class="clicks">
+      <button type="button" data-mouse="1">Left click</button>
+      <button type="button" data-mouse="2">Right click</button>
+    </div>
   </div>
-  <div class="lookpad" id="lookpad">Drag to look<br>Tap to click</div>
-  <div class="actions">
-    <button type="button" data-key="Space">Jump</button>
-    <button type="button" data-key="ShiftLeft">Sneak</button>
-    <button type="button" data-key="ControlLeft">Sprint</button>
-    <button type="button" data-mouse="2">Use</button>
-    <button type="button" data-key="KeyE">Inventory</button>
-    <button type="button" data-key="KeyQ">Drop</button>
-    <button type="button" data-key="Escape">Esc</button>
-    <button type="button" data-key="KeyT">Chat</button>
+
+  <div id="controls" hidden>
+    <div class="pad">
+      <button type="button" data-key="KeyW">W</button>
+      <button type="button" data-key="KeyA">A</button>
+      <button type="button" data-key="KeyS">S</button>
+      <button type="button" data-key="KeyD">D</button>
+    </div>
+    <div class="lookpad" id="lookpad">Drag to look<br>Tap to click</div>
+    <div class="actions">
+      <button type="button" data-key="Space">Jump</button>
+      <button type="button" data-key="ShiftLeft">Sneak</button>
+      <button type="button" data-key="ControlLeft">Sprint</button>
+      <button type="button" data-mouse="2">Use</button>
+      <button type="button" data-key="KeyE">Inventory</button>
+      <button type="button" data-key="KeyQ">Drop</button>
+      <button type="button" data-key="Escape">Esc</button>
+      <button type="button" data-key="KeyT">Chat</button>
+    </div>
   </div>
 </div>
 
@@ -130,8 +177,10 @@ const screenEl = document.querySelector("#screen");
 const statusEl = document.querySelector("#status");
 const reconnectBtn = document.querySelector("#reconnect");
 const keyboardBtn = document.querySelector("#keyboardBtn");
+const trackpadBtn = document.querySelector("#trackpadBtn");
 const controlsBtn = document.querySelector("#controlsBtn");
 const fullscreenBtn = document.querySelector("#fullscreenBtn");
+const trackpadEl = document.querySelector("#trackpad");
 const controlsEl = document.querySelector("#controls");
 const lookpad = document.querySelector("#lookpad");
 const vk = document.querySelector("#vk");
@@ -144,6 +193,7 @@ const passwordCancel = document.querySelector("#passwordCancel");
 let rfb = null;
 let canvas = null;
 let cursor = null;
+let mode = "none";
 
 /* ---------- keysyms ---------- */
 const CODE_KEYSYMS = {
@@ -152,8 +202,14 @@ const CODE_KEYSYMS = {
   ArrowLeft: 0xff51, ArrowUp: 0xff52, ArrowRight: 0xff53, ArrowDown: 0xff54,
   ShiftLeft: 0xffe1, ShiftRight: 0xffe2, ControlLeft: 0xffe3, ControlRight: 0xffe4,
   AltLeft: 0xffe9, AltRight: 0xffea, MetaLeft: 0xffeb, MetaRight: 0xffec,
+  Super_L: 0xffeb,
   Home: 0xff50, End: 0xff57, PageUp: 0xff55, PageDown: 0xff56,
   F1: 0xffbe, F2: 0xffbf, F3: 0xffc0, F4: 0xffc1, F5: 0xffc2, F6: 0xffc3,
+};
+
+const COMBOS = {
+  "alt-tab": [[0xffe9, "AltLeft"], [0xff09, "Tab"]],
+  "alt-f4": [[0xffe9, "AltLeft"], [0xffc1, "F4"]],
 };
 
 function charKeysym(ch) {
@@ -172,6 +228,11 @@ function keysymForCode(code) {
 function keyDown(keysym, code) { if (rfb) rfb.sendKey(keysym, code || null, true); }
 function keyUp(keysym, code) { if (rfb) rfb.sendKey(keysym, code || null, false); }
 function tapKey(keysym, code) { if (rfb) rfb.sendKey(keysym, code || null); }
+
+function sendCombo(keysyms) {
+  for (const [keysym, code] of keysyms) keyDown(keysym, code);
+  for (const [keysym, code] of [...keysyms].reverse()) keyUp(keysym, code);
+}
 
 /* ---------- on-screen keyboard ---------- */
 keyboardBtn.addEventListener("click", () => {
@@ -206,12 +267,256 @@ fullscreenBtn.addEventListener("click", async () => {
   }
 });
 
-/* ---------- touch controls ---------- */
-controlsBtn.addEventListener("click", () => {
-  const show = controlsEl.hidden;
-  controlsEl.hidden = !show;
-  controlsBtn.setAttribute("aria-pressed", String(show));
+/* ---------- pointer plumbing (noVNC maps canvas mouse events itself) ---------- */
+function canvasRect() { return canvas ? canvas.getBoundingClientRect() : null; }
+
+function clampToCanvas(x, y) {
+  const rect = canvasRect();
+  if (!rect || rect.width === 0 || rect.height === 0) return { x, y };
+  return {
+    x: Math.min(Math.max(x, rect.left + 1), rect.right - 1),
+    y: Math.min(Math.max(y, rect.top + 1), rect.bottom - 1),
+  };
+}
+
+function dispatchMouse(type, x, y, buttons, button) {
+  if (!canvas) return;
+  canvas.dispatchEvent(new MouseEvent(type, {
+    clientX: x, clientY: y, buttons, button: button || 0,
+    bubbles: true, cancelable: true, view: window,
+  }));
+}
+
+function ensureCursor() {
+  const rect = canvasRect();
+  if (cursor && rect) {
+    cursor = clampToCanvas(cursor.x, cursor.y);
+    return cursor;
+  }
+  if (!rect) return null;
+  cursor = { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
+  return cursor;
+}
+
+function moveCursorBy(dx, dy) {
+  const position = ensureCursor();
+  if (!position) return;
+  const next = clampToCanvas(position.x + dx, position.y + dy);
+  cursor = next;
+  dispatchMouse("mousemove", next.x, next.y, 0, 0);
+}
+
+function clickMouse(button) {
+  const position = ensureCursor();
+  if (!position) return;
+  const mask = button === 2 ? 2 : button === 3 ? 4 : 1;
+  dispatchMouse("mousemove", position.x, position.y, 0, button || 0);
+  dispatchMouse("mousedown", position.x, position.y, mask, button || 0);
+  dispatchMouse("mouseup", position.x, position.y, 0, button || 0);
+}
+
+function scrollAtCursor(deltaY) {
+  const position = ensureCursor();
+  if (!position || !canvas) return;
+  canvas.dispatchEvent(new WheelEvent("wheel", {
+    clientX: position.x, clientY: position.y, deltaY, deltaMode: 0, buttons: 0,
+    bubbles: true, cancelable: true,
+  }));
+}
+
+window.addEventListener("resize", () => {
+  if (cursor) cursor = clampToCanvas(cursor.x, cursor.y);
 });
+
+/* ---------- trackpad overlay ---------- */
+const TAP_SLOP = 14;
+const TAP_TIME = 500;
+const HOLD_DELAY = 420;
+const SCROLL_DRAG_STEP = 20;
+
+const track = {
+  pointers: new Map(),
+  gesture: null,
+  lastX: 0,
+  lastY: 0,
+  moved: 0,
+  start: 0,
+  wheel: 0,
+  dragging: false,
+  multi: false,
+  holdTimer: null,
+};
+
+function trackReset() {
+  clearTimeout(track.holdTimer);
+  track.holdTimer = null;
+  if (track.dragging) {
+    const position = ensureCursor();
+    if (position) dispatchMouse("mouseup", position.x, position.y, 0, 0);
+  }
+  track.pointers.clear();
+  track.gesture = null;
+  track.dragging = false;
+  track.multi = false;
+  track.wheel = 0;
+  track.moved = 0;
+}
+
+function trackDown(event) {
+  if (event.target.closest("button")) return;
+  event.preventDefault();
+  if (trackpadEl.setPointerCapture) trackpadEl.setPointerCapture(event.pointerId);
+  track.pointers.set(event.pointerId, { x: event.clientX, y: event.clientY });
+
+  if (track.pointers.size === 1) {
+    track.gesture = "single";
+    track.lastX = event.clientX;
+    track.lastY = event.clientY;
+    track.moved = 0;
+    track.multi = false;
+    track.start = Date.now();
+    track.wheel = 0;
+    track.dragging = false;
+    ensureCursor();
+    track.holdTimer = setTimeout(() => {
+      if (track.moved > TAP_SLOP || track.dragging) return;
+      const position = ensureCursor();
+      if (!position) return;
+      track.dragging = true;
+      dispatchMouse("mousedown", position.x, position.y, 1, 0);
+      trackpadEl.dataset.drag = "1";
+    }, HOLD_DELAY);
+  } else if (track.pointers.size === 2) {
+    clearTimeout(track.holdTimer);
+    track.holdTimer = null;
+    if (track.dragging) {
+      const position = ensureCursor();
+      if (position) dispatchMouse("mouseup", position.x, position.y, 0, 0);
+      track.dragging = false;
+      delete trackpadEl.dataset.drag;
+    }
+    track.gesture = "multi";
+    track.multi = true;
+    const points = [...track.pointers.values()];
+    track.lastX = (points[0].x + points[1].x) / 2;
+    track.lastY = (points[0].y + points[1].y) / 2;
+    track.moved = 0;
+    track.start = Date.now();
+    track.wheel = 0;
+  }
+}
+
+function trackMove(event) {
+  if (!track.pointers.has(event.pointerId)) return;
+  event.preventDefault();
+  track.pointers.set(event.pointerId, { x: event.clientX, y: event.clientY });
+
+  if (track.gesture === "single" && track.pointers.size === 1) {
+    const point = track.pointers.get(event.pointerId);
+    const dx = point.x - track.lastX;
+    const dy = point.y - track.lastY;
+    if (dx === 0 && dy === 0) return;
+    track.lastX = point.x;
+    track.lastY = point.y;
+    const distance = Math.abs(dx) + Math.abs(dy);
+    track.moved += distance;
+    const gain = distance > 40 ? 2.6 : distance > 14 ? 1.9 : 1.25;
+    moveCursorBy(dx * gain, dy * gain);
+  } else if (track.gesture === "multi" && track.pointers.size >= 2) {
+    const points = [...track.pointers.values()];
+    const cx = points.reduce((sum, point) => sum + point.x, 0) / points.length;
+    const cy = points.reduce((sum, point) => sum + point.y, 0) / points.length;
+    const dx = cx - track.lastX;
+    const dy = cy - track.lastY;
+    track.lastX = cx;
+    track.lastY = cy;
+    track.moved += Math.abs(dx) + Math.abs(dy);
+    track.wheel += dy;
+    while (Math.abs(track.wheel) >= SCROLL_DRAG_STEP) {
+      const step = track.wheel > 0 ? 60 : -60;
+      scrollAtCursor(step);
+      /* noVNC only sends a wheel step per 50 accumulated pixels */
+      track.wheel -= track.wheel > 0 ? SCROLL_DRAG_STEP : -SCROLL_DRAG_STEP;
+    }
+  }
+}
+
+function trackUp(event, cancelled) {
+  if (!track.pointers.has(event.pointerId)) return;
+  track.pointers.delete(event.pointerId);
+  clearTimeout(track.holdTimer);
+  track.holdTimer = null;
+
+  if (track.pointers.size === 1) {
+    const [rest] = [...track.pointers.values()];
+    track.gesture = "single";
+    track.lastX = rest.x;
+    track.lastY = rest.y;
+    return;
+  }
+  if (track.pointers.size > 0) return;
+
+  const multi = track.multi;
+  const elapsed = Date.now() - track.start;
+  track.gesture = null;
+
+  if (track.dragging) {
+    const position = ensureCursor();
+    if (position) dispatchMouse("mouseup", position.x, position.y, 0, 0);
+    track.dragging = false;
+    delete trackpadEl.dataset.drag;
+    return;
+  }
+  if (cancelled) return;
+  if (track.moved > TAP_SLOP || elapsed > TAP_TIME) return;
+
+  clickMouse(multi ? 2 : 0);
+}
+
+trackpadEl.addEventListener("pointerdown", trackDown);
+trackpadEl.addEventListener("pointermove", trackMove);
+trackpadEl.addEventListener("pointerup", event => trackUp(event, false));
+trackpadEl.addEventListener("pointercancel", event => trackUp(event, true));
+
+for (const button of trackpadEl.querySelectorAll("button[data-mouse]")) {
+  button.addEventListener("pointerdown", event => {
+    event.preventDefault();
+    clickMouse(Number(button.dataset.mouse));
+  });
+}
+for (const button of trackpadEl.querySelectorAll("button[data-scroll]")) {
+  button.addEventListener("pointerdown", event => {
+    event.preventDefault();
+    scrollAtCursor(Number(button.dataset.scroll));
+  });
+}
+for (const button of trackpadEl.querySelectorAll("button[data-combo]")) {
+  button.addEventListener("pointerdown", event => {
+    event.preventDefault();
+    const combo = COMBOS[button.dataset.combo];
+    if (combo) sendCombo(combo);
+  });
+}
+for (const button of trackpadEl.querySelectorAll("button[data-key]")) {
+  button.addEventListener("pointerdown", event => {
+    event.preventDefault();
+    tapKey(keysymForCode(button.dataset.key), button.dataset.key);
+  });
+}
+
+/* ---------- game overlay ---------- */
+controlsBtn.addEventListener("click", () => setMode("game"));
+trackpadBtn.addEventListener("click", () => setMode("trackpad"));
+
+function setMode(next) {
+  mode = mode === next ? "none" : next;
+  trackpadEl.hidden = mode !== "trackpad";
+  controlsEl.hidden = mode !== "game";
+  trackpadBtn.setAttribute("aria-pressed", String(mode === "trackpad"));
+  controlsBtn.setAttribute("aria-pressed", String(mode === "game"));
+  if (mode === "trackpad") ensureCursor();
+  if (mode !== "trackpad") trackReset();
+}
 
 for (const button of controlsEl.querySelectorAll("button[data-key]")) {
   const code = button.dataset.key;
@@ -232,51 +537,6 @@ for (const button of controlsEl.querySelectorAll("button[data-key]")) {
   button.addEventListener("pointerup", release);
   button.addEventListener("pointercancel", release);
   button.addEventListener("lostpointercapture", release);
-}
-
-/* mouse helpers: noVNC maps canvas mouse events, so dispatch them for it */
-function canvasRect() { return canvas ? canvas.getBoundingClientRect() : null; }
-
-function clampToCanvas(x, y) {
-  const rect = canvasRect();
-  if (!rect) return { x, y };
-  return {
-    x: Math.min(Math.max(x, rect.left + 1), rect.right - 1),
-    y: Math.min(Math.max(y, rect.top + 1), rect.bottom - 1),
-  };
-}
-
-function dispatchMouse(type, x, y, buttons, button) {
-  if (!canvas) return;
-  canvas.dispatchEvent(new MouseEvent(type, {
-    clientX: x, clientY: y, buttons, button: button || 0,
-    bubbles: true, cancelable: true, view: window,
-  }));
-}
-
-function ensureCursor() {
-  if (cursor) return cursor;
-  const rect = canvasRect();
-  if (!rect) return null;
-  cursor = { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
-  return cursor;
-}
-
-function moveCursorBy(dx, dy) {
-  const position = ensureCursor();
-  if (!position) return;
-  const next = clampToCanvas(position.x + dx, position.y + dy);
-  cursor = next;
-  dispatchMouse("mousemove", next.x, next.y, 0, 0);
-}
-
-function clickMouse(button) {
-  const position = ensureCursor();
-  if (!position) return;
-  const mask = button === 2 ? 2 : 1;
-  dispatchMouse("mousemove", position.x, position.y, 0, button || 0);
-  dispatchMouse("mousedown", position.x, position.y, mask, button || 0);
-  dispatchMouse("mouseup", position.x, position.y, 0, button || 0);
 }
 
 const LOOK_GAIN = 1.6;
@@ -308,7 +568,6 @@ function endLook(event) {
 lookpad.addEventListener("pointerup", endLook);
 lookpad.addEventListener("pointercancel", endLook);
 
-/* right click button */
 for (const button of controlsEl.querySelectorAll("button[data-mouse]")) {
   button.addEventListener("pointerdown", event => {
     event.preventDefault();
@@ -340,7 +599,18 @@ passwordCancel.addEventListener("click", () => {
 });
 
 /* ---------- connection ---------- */
+function adoptCanvas(connection) {
+  const element = connection._canvas || screenEl.querySelector("canvas");
+  if (!element || element === canvas) return;
+  canvas = element;
+  /* keep the virtual cursor in sync when the canvas is used directly */
+  element.addEventListener("mousemove", event => {
+    cursor = { x: event.clientX, y: event.clientY };
+  }, true);
+}
+
 function connect() {
+  trackReset();
   if (rfb) {
     try { rfb.disconnect(); } catch { /* already gone */ }
     rfb = null;
@@ -356,7 +626,7 @@ function connect() {
     const scheme = location.protocol === "https:" ? "wss" : "ws";
     const connection = new RFB(screenEl, scheme + "://" + location.host + "/websockify");
     rfb = connection;
-    canvas = connection._canvas || screenEl.querySelector("canvas");
+    adoptCanvas(connection);
 
     connection.scaleViewport = true;
     connection.resizeSession = false;
@@ -365,7 +635,7 @@ function connect() {
     connection.dragViewport = false;
 
     connection.addEventListener("connect", () => {
-      canvas = connection._canvas || screenEl.querySelector("canvas");
+      adoptCanvas(connection);
       statusEl.textContent = "Connected";
       reconnectBtn.style.display = "none";
     });
@@ -380,6 +650,7 @@ function connect() {
       if (rfb !== connection) return;
       rfb = null;
       canvas = null;
+      trackReset();
       statusEl.textContent = event.detail?.clean ? "Disconnected" : "Connection lost";
       reconnectBtn.style.display = "inline-flex";
     });
