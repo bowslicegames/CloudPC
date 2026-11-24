@@ -214,11 +214,25 @@ runuser -u cloud -- env HOME=/home/cloud DISPLAY=:0 \
   startxfce4 &
 DESKTOP_PID=$!
 
-echo "CloudPC: starting password-protected VNC server..."
 # Keep x11vnc output visible: startup failures must be diagnosable in Altare.
+#
+# With -noxdamage x11vnc has no idea which rectangles changed: it re-reads the
+# whole framebuffer every poll, and on a ~1 CPU container that read is slow
+# enough to catch only part of each redraw. The desktop then shows stale halves
+# of the screen and the polling steals CPU from Minecraft. XDAMAGE (supported by
+# Xvfb) tells x11vnc exactly what changed, so only those rectangles are read and
+# shipped. Set VNC_NO_DAMAGE=1 to fall back to full-screen polling if some GL
+# application ever fails to update under DAMAGE.
+VNC_EXTRA_ARGS=()
+if [[ "${VNC_NO_DAMAGE:-0}" == "1" ]]; then
+  echo "CloudPC: VNC_NO_DAMAGE=1, polling the whole framebuffer instead of using XDAMAGE."
+  VNC_EXTRA_ARGS+=(-noxdamage)
+fi
+echo "CloudPC: starting password-protected VNC server..."
 runuser -u cloud -- env HOME=/home/cloud DISPLAY=:0 \
   x11vnc -display :0 -rfbauth "$VNC_PASSWD_FILE" -rfbport "${VNC_PORT}" \
-  -forever -shared -noxdamage -repeat -localhost &
+  -forever -shared -repeat -localhost -wait 5 -defer 5 \
+  "${VNC_EXTRA_ARGS[@]}" &
 VNC_PID=$!
 
 VNC_READY=0

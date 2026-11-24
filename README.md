@@ -102,6 +102,10 @@ If it is still slow:
 
 About the mods: **Sodium** targets OpenGL 4.5 hardware and replaces Mojang's terrain renderer with GPU-driven drawing, so on a software rasteriser it can be slightly faster or slower than vanilla depending on the scene. If numbers look wrong, try one session with Sodium removed. **FerriteCore** only saves memory and does not change frame rate. Run `glxinfo -B` in a desktop terminal to confirm: when it reports `llvmpipe (LLVM ...)`, the renderer is the CPU.
 
+### Stale halves or torn pictures
+
+If parts of the picture stop updating — a stale half of a window, or a torn frame while the game redraws — x11vnc is polling the framebuffer instead of using the XDAMAGE extension. Polling re-reads the whole 1280×800 screen every pass, which on ~1 CPU catches only part of each redraw and competes with Minecraft for CPU. CloudPC uses XDAMAGE by default, so only the rectangles that actually changed are read and sent, and updates leave within 5 ms (`-wait 5 -defer 5`). If some GL application ever stops updating the picture under XDAMAGE, set the app environment variable `VNC_NO_DAMAGE=1` to return to full-screen polling.
+
 This does not turn the container into a gaming host. Real frame rates need GPU passthrough or an ordinary machine.
 
 ## Persistence
