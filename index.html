@@ -36,6 +36,7 @@ button{
 }
 button[aria-pressed="true"],button.primary{background:var(--accent);color:var(--accent-ink)}
 #reconnect{display:none}
+#streamBtn{min-width:0;padding:0 10px;font-size:13px;font-weight:600}
 #stage{position:relative;flex:1 1 auto;min-height:0;display:flex}
 #screen{position:relative;flex:1 1 auto;display:flex;align-items:center;justify-content:center;overflow:hidden;background:#000}
 #screen canvas{max-width:100%;max-height:100%;touch-action:none}
@@ -119,7 +120,9 @@ button[aria-pressed="true"],button.primary{background:var(--accent);color:var(--
     <button id="trackpadBtn" type="button" title="Trackpad (touch pointer)" aria-label="Trackpad" aria-pressed="false">🖱</button>
     <button id="controlsBtn" type="button" title="Game controls" aria-label="Game controls" aria-pressed="false">🎮</button>
     <button id="fullscreenBtn" type="button" title="Fullscreen" aria-label="Fullscreen">⛶</button>
+    <button id="streamBtn" type="button" title="Stream quality">Fast</button>
     <button id="reconnect" class="primary" type="button">Reconnect</button>
+
   </div>
 </header>
 
@@ -189,6 +192,7 @@ const keyboardBtn = document.querySelector("#keyboardBtn");
 const trackpadBtn = document.querySelector("#trackpadBtn");
 const controlsBtn = document.querySelector("#controlsBtn");
 const fullscreenBtn = document.querySelector("#fullscreenBtn");
+const streamBtn = document.querySelector("#streamBtn");
 const trackpadEl = document.querySelector("#trackpad");
 const controlsEl = document.querySelector("#controls");
 const lookpad = document.querySelector("#lookpad");
@@ -307,17 +311,45 @@ function ensureCursor() {
   return cursor;
 }
 
+/* Every pointer event costs the desktop an XTest motion that x11vnc then has to
+ * process, and the desktop CPU is the scarce resource here. The remote server
+ * only ever sees the pointer position it reads next, so all the movements inside
+ * one animation frame can be collapsed into a single event. */
+let moveFrame = 0;
+let pendingMove = null;
+
+function flushMove() {
+  moveFrame = 0;
+  const next = pendingMove;
+  pendingMove = null;
+  if (!next || !canvas) return;
+  dispatchMouse("mousemove", next.x, next.y, 0, 0);
+}
+
+function cancelMove() {
+  if (moveFrame) cancelAnimationFrame(moveFrame);
+  moveFrame = 0;
+  pendingMove = null;
+}
+
+function queueMove(x, y) {
+  pendingMove = { x, y };
+  if (!moveFrame) moveFrame = requestAnimationFrame(flushMove);
+}
+
 function moveCursorBy(dx, dy) {
   const position = ensureCursor();
   if (!position) return;
   const next = clampToCanvas(position.x + dx, position.y + dy);
   cursor = next;
-  dispatchMouse("mousemove", next.x, next.y, 0, 0);
+  queueMove(next.x, next.y);
 }
 
 function clickMouse(button) {
   const position = ensureCursor();
   if (!position) return;
+  /* a queued move would land after the click and drag the cursor away */
+  cancelMove();
   const mask = button === 2 ? 2 : button === 3 ? 4 : 1;
   dispatchMouse("mousemove", position.x, position.y, 0, button || 0);
   dispatchMouse("mousedown", position.x, position.y, mask, button || 0);
@@ -574,7 +606,56 @@ function remotePixelsPerCssPixel() {
   return canvas.width / canvas.clientWidth || 1;
 }
 
+/* The look pad is relative, while the trackpad above stays absolute.
+ *
+ * Minecraft grabs the pointer while you play and pulls it back to the middle of
+ * its window on every client tick, so the only thing it can read is how far the
+ * cursor sits from that middle. The old code kept one cumulative cursor and
+ * clamped it to the screen, which is why looking up died once the pointer hit the
+ * top edge: every later upward move was clamped away. Each update is now "middle
+ * of the screen plus this interval's travel", so every direction always has a
+ * full half screen of room and can never run out.
+ *
+ * Minecraft reads the mouse 20 times a second no matter what the frame rate is,
+ * so movement is collected and sent at that rate: the same turning speed at 5 or
+ * 60 fps, one input event per tick instead of dozens for the server to process,
+ * and nothing lost, because travel that has not been sent yet stays queued. */
+const LOOK_INTERVAL = 50;
 let look = null;
+let lookTimer = 0;
+let lookSentAt = 0;
+const lookTravel = { x: 0, y: 0 };
+
+function flushLook() {
+  if (lookTimer) { clearTimeout(lookTimer); lookTimer = 0; }
+  const dx = lookTravel.x;
+  const dy = lookTravel.y;
+  if (!dx && !dy) return;
+  lookTravel.x = 0;
+  lookTravel.y = 0;
+  lookSentAt = performance.now();
+  const rect = canvasRect();
+  if (!rect || !canvas) return;
+  const gain = lookGain * remotePixelsPerCssPixel();
+  const limitX = Math.max(1, rect.width / 2 - 2);
+  const limitY = Math.max(1, rect.height / 2 - 2);
+  const within = (value, limit) => Math.max(-limit, Math.min(limit, value));
+  const x = rect.left + rect.width / 2 + within(dx * gain, limitX);
+  const y = rect.top + rect.height / 2 + within(dy * gain, limitY);
+  cancelMove();
+  cursor = { x, y };
+  dispatchMouse("mousemove", x, y, 0, 0);
+}
+
+function queueLook() {
+  if (lookTimer) return;
+  const wait = LOOK_INTERVAL - (performance.now() - lookSentAt);
+  if (wait <= 0) {
+    flushLook();
+    return;
+  }
+  lookTimer = setTimeout(() => { lookTimer = 0; flushLook(); }, wait);
+}
 
 lookpad.addEventListener("pointerdown", event => {
   event.preventDefault();
@@ -582,26 +663,29 @@ lookpad.addEventListener("pointerdown", event => {
   look = { id: event.pointerId, x: event.clientX, y: event.clientY, moved: 0 };
 });
 
-lookpad.addEventListener("pointermove", event => {
+/* Pointer capture is not dependable in every iPad browser, so the move and
+ * release handlers live on the window and follow only the pointer that started
+ * the gesture. Otherwise a drag that slides off the pad stops turning the view. */
+window.addEventListener("pointermove", event => {
   if (!look || event.pointerId !== look.id) return;
   event.preventDefault();
-  const dx = event.clientX - look.x;
-  const dy = event.clientY - look.y;
+  lookTravel.x += event.clientX - look.x;
+  lookTravel.y += event.clientY - look.y;
+  look.moved += Math.abs(event.clientX - look.x) + Math.abs(event.clientY - look.y);
   look.x = event.clientX;
   look.y = event.clientY;
-  look.moved += Math.abs(dx) + Math.abs(dy);
-  const gain = lookGain * remotePixelsPerCssPixel();
-  moveCursorBy(dx * gain, dy * gain);
-});
+  queueLook();
+}, { passive: false });
 
 function endLook(event) {
   if (!look || event.pointerId !== look.id) return;
   const moved = look.moved;
   look = null;
+  flushLook(); /* send the tail of the drag straight away */
   if (moved < 10) clickMouse(0);
 }
-lookpad.addEventListener("pointerup", endLook);
-lookpad.addEventListener("pointercancel", endLook);
+window.addEventListener("pointerup", endLook);
+window.addEventListener("pointercancel", endLook);
 
 for (const button of controlsEl.querySelectorAll("button[data-mouse]")) {
   button.addEventListener("pointerdown", event => {
@@ -631,6 +715,45 @@ passwordForm.addEventListener("submit", event => {
 passwordCancel.addEventListener("click", () => {
   passwordPrompt.hidden = true;
   if (rfb) rfb.disconnect();
+});
+
+/* ---------- what runs where ----------
+ * The container's CPU is the bottleneck and the device looking at the stream is
+ * idle, so the server should compress as little as possible: decompressing and
+ * scaling the picture is nearly free in the browser, while every byte x11vnc
+ * compresses is CPU taken away from Minecraft. */
+const STREAM_MODES = [
+  { name: "Fast", title: "Fast stream: least server CPU, more bandwidth", compression: 0, quality: 5 },
+  { name: "Balanced", title: "Balanced stream: noVNC defaults", compression: 2, quality: 7 },
+  { name: "Sharp", title: "Sharp stream: least bandwidth, most server CPU", compression: 6, quality: 9 },
+];
+const STREAM_KEY = "cloudpc.streamMode";
+let streamMode = 0;
+try {
+  const stored = Number(localStorage.getItem(STREAM_KEY));
+  if (Number.isInteger(stored) && stored >= 0 && stored < STREAM_MODES.length) streamMode = stored;
+} catch {
+  /* storage can be blocked; the default stands */
+}
+
+function applyStreamMode(connection) {
+  const setting = STREAM_MODES[streamMode];
+  streamBtn.textContent = setting.name;
+  streamBtn.title = setting.title;
+  if (!connection) return;
+  try {
+    connection.compressionLevel = setting.compression;
+    connection.qualityLevel = setting.quality;
+  } catch {
+    /* an older noVNC without these properties simply keeps its defaults */
+  }
+}
+
+applyStreamMode(null);
+streamBtn.addEventListener("click", () => {
+  streamMode = (streamMode + 1) % STREAM_MODES.length;
+  try { localStorage.setItem(STREAM_KEY, String(streamMode)); } catch { /* ignore */ }
+  applyStreamMode(rfb);
 });
 
 /* ---------- connection ---------- */
@@ -671,6 +794,7 @@ function connect() {
 
     connection.addEventListener("connect", () => {
       adoptCanvas(connection);
+      applyStreamMode(connection);
       statusEl.textContent = "Connected";
       reconnectBtn.style.display = "none";
     });

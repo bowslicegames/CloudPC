@@ -10,7 +10,8 @@ A browser-accessible, lightweight Debian desktop intended for an Altare Docker A
 - XFCE desktop, Thunar file manager and terminal
 - noVNC browser access with a phone- and tablet-friendly client
 - VNC password authentication from the `VNC_PASSWORD` environment variable
-- Touch controls: on-screen keyboard, a trackpad overlay that replaces the mouse for the whole desktop, and a game overlay (W/A/S/D, jump, sneak, sprint, use, inventory, drop, chat and a look/tap pad)
+- Touch controls: on-screen keyboard, a trackpad overlay that replaces the mouse for the whole desktop, and a game overlay (W/A/S/D, jump, sneak, sprint, use, inventory, drop, chat and a relative look/tap pad that can look in any direction)
+- A stream quality selector that keeps compression work in the browser instead of on the CPU-starved desktop
 - Prism Launcher from Debian trixie-backports, preinstalled with a ready-to-run Minecraft instance and a one-tap desktop shortcut
 - OpenJDK 21 runtime
 - Persistent launcher configuration, accounts, instances, worlds, downloads and desktop files under `/data`
@@ -69,7 +70,7 @@ The instance ships as a descriptor only: Prism Launcher downloads that Minecraft
   - The buttons along the bottom give Left click, Right click, Scroll up, Scroll down, Alt+Tab, Alt+F4 and Menu (Super).
   - While it is on it captures touches, so toggle it off to tap the desktop directly.
 - **🎮** toggles the game overlay. Left side is W/A/S/D; the right side has Jump, Sneak, Sprint, Use (right click), Inventory, Drop, Esc and Chat, all as press-and-hold buttons.
-- The **Look** pad between them drags the pointer for camera movement (once Minecraft has captured the cursor this reads as mouse look) and a tap is a left click. The **Look speed** slider under it sets how far the pointer travels per pixel of finger movement: `1.0` follows your finger exactly, the default `0.45` is slower because Minecraft applies its own mouse sensitivity on top. The value is remembered per browser, so tune it on the device you play on.
+- The **Look** pad between them turns the camera in every direction — up and down included, without ever running out of room — and a tap is a left click. It works in relative mode: Minecraft grabs the pointer while you play and pulls it back to the middle of its window on every tick, so the pad reports "middle of the screen plus this tick's travel", never a cursor that can hit the edge of the screen and stop. Movement is sent 20 times a second, which is Minecraft's own mouse rate, so turning speed is the same whatever the frame rate is. The **Look speed** slider under it sets how far the pointer travels per pixel of finger movement: `1.0` follows your finger exactly, the default `0.45` is slower because Minecraft applies its own mouse sensitivity on top. The value is remembered per browser, so tune it on the device you play on. Because turning now follows your finger at a steady rate instead of accelerating the longer you hold it, a value you tuned on an older build may feel slow — raise the slider a notch.
 - **⛶** toggles fullscreen. The toolbar and overlay respect phone safe areas.
 - The desktop defaults to 1280×800 with 120 DPI fonts and a 24 px cursor for touch targets; override with `SCREEN_WIDTH` / `SCREEN_HEIGHT`. Window compositing is off because rendering is CPU-based.
 
@@ -93,6 +94,18 @@ What CloudPC already does for you:
 - A fresh instance starts at render distance 3, simulation distance 4, fast graphics, smooth lighting off, no clouds, no entity shadows, minimal particles and vsync off.
 - The image ships **RenderScale** 1.3.6 with the Cloth Config it needs, preset to `scale: 0.5`: the world is drawn at half the window resolution and upscaled, so terrain costs a quarter of the pixels while the HUD stays sharp. The jars are only added to instances that are NeoForge 1.21.11 with NeoForge 21.11.6 or newer (the builds are pinned to that version, and a mismatched loader mod stops Minecraft from starting), and never when the instance already has its own build of the same mod. Change the factor in game under **Mods → RenderScale → Config → Scale factor** (0.4 or 0.33 goes further), or delete both jars from `<instance>/.minecraft/mods`. Set `RENDERSCALE=0` in the app environment to stop CloudPC adding them at all.
 - Minecraft is forced out of fullscreen on start. The browser already scales the desktop to the device, and fullscreen is the most expensive case for a CPU rasteriser.
+
+### What the browser does, and what it cannot do
+
+Minecraft's own rendering cannot be moved into the iPad or phone browser: the game runs on the desktop, the desktop has no GPU, so llvmpipe shades every pixel on the container's CPU and the browser only ever sees the result as a stream. There is no way to hand the world geometry to the browser's WebGL — Minecraft has no such mode, and the world state lives on the server.
+
+Everything around that picture is already offloaded, and CloudPC pushes what is left towards the browser:
+
+- noVNC decompresses each update and scales the 1280×800 desktop to the device in the browser. Compositing, scaling and upsampling cost the container nothing.
+- The **stream quality** button in the toolbar (Fast → Balanced → Sharp) decides how much of the picture compression is left to the desktop. **Fast** (the default) asks x11vnc for no zlib compression and lower JPEG quality: the container stops spending CPU on compression while the browser decodes a larger stream and upscales it. That is the right trade while the CPU is the bottleneck, which it is here, at the cost of bandwidth. **Balanced** is noVNC's usual setting and **Sharp** compresses hardest for the smallest stream and the most server CPU. The choice is remembered per browser.
+- The look pad and the trackpad send at most one pointer event per animation frame, and the look pad one per 50 ms, because Minecraft only reads the mouse 20 times a second. The desktop gets a fraction of the input events it used to have to process.
+
+What this does not do is make the CPU draw faster. If you want the frame rate up, the levers are still more CPU for the app, a smaller game window and a lower RenderScale factor.
 
 How the numbers behave: at `scale 0.5` the terrain shader has a quarter of the pixels to shade, which typically turns 5 fps into 12–18 fps. Nothing reaches 30 fps on one core, because independent of pixel count the CPU also has to build chunk meshes, tick the world, run the JVM's GC and encode the VNC stream, and those do not shrink with resolution.
 
