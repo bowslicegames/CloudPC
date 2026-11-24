@@ -9,8 +9,41 @@ set -Eeuo pipefail
 : "${JAVA_MIN_RAM:=512M}"
 : "${JAVA_MAX_RAM:=1536M}"
 
+# Minecraft has no GPU here: it draws through Mesa's llvmpipe CPU rasteriser.
+# llvmpipe starts one worker per core and takes that count from the host machine,
+# not from the container's CPU quota, so a ~1 CPU app ends up with dozens of
+# threads fighting over one core. Pin it to the quota, and keep the LLVM-compiled
+# shader cache on /data so Minecraft does not recompile every shader each boot.
+cgroup_cpu_limit() {
+  local quota period
+  if [[ -r /sys/fs/cgroup/cpu.max ]]; then
+    read -r quota period < /sys/fs/cgroup/cpu.max || true
+    if [[ "$quota" =~ ^[0-9]+$ ]] && [[ "${period:-0}" =~ ^[0-9]+$ ]] && (( period > 0 )); then
+      echo $(( (quota + period - 1) / period ))
+      return 0
+    fi
+  fi
+  if [[ -r /sys/fs/cgroup/cpu/cpu.cfs_quota_us && -r /sys/fs/cgroup/cpu/cpu.cfs_period_us ]]; then
+    read -r quota < /sys/fs/cgroup/cpu/cpu.cfs_quota_us || true
+    read -r period < /sys/fs/cgroup/cpu/cpu.cfs_period_us || true
+    if [[ "$quota" =~ ^[0-9]+$ ]] && [[ "${period:-0}" =~ ^[0-9]+$ ]] && (( period > 0 )) && (( quota > 0 )); then
+      echo $(( (quota + period - 1) / period ))
+      return 0
+    fi
+  fi
+  nproc
+}
+
+LP_NUM_THREADS="${LP_NUM_THREADS:-$(cgroup_cpu_limit)}"
+if ! [[ "${LP_NUM_THREADS:-}" =~ ^[1-9][0-9]*$ ]]; then
+  LP_NUM_THREADS=1
+fi
+MESA_SHADER_CACHE_DIR="${MESA_SHADER_CACHE_DIR:-/data/.cache/mesa}"
+MESA_SHADER_CACHE_MAX_SIZE="${MESA_SHADER_CACHE_MAX_SIZE:-512M}"
+export LP_NUM_THREADS MESA_SHADER_CACHE_DIR MESA_SHADER_CACHE_MAX_SIZE
+
 mkdir -p /data/.vnc /data/.minecraft /data/.local/share/PrismLauncher \
-         /data/.config /data/Desktop /data/Downloads
+         /data/.config /data/Desktop /data/Downloads "$MESA_SHADER_CACHE_DIR"
 chown -R cloud:cloud /data
 
 # Keep user data on the persistent /data mount.
@@ -34,9 +67,26 @@ export XDG_RUNTIME_DIR
 # Prism Launcher is preinstalled in the image. Seed a ready-to-run instance and
 # a one-tap desktop shortcut on first boot so the desktop needs no setup.
 PRISM_DIR=/data/.local/share/PrismLauncher
+INSTANCE_DIR="$PRISM_DIR/instances/Minecraft"
 mkdir -p "$PRISM_DIR/instances"
-if [[ ! -f "$PRISM_DIR/instances/Minecraft/mmc-pack.json" ]]; then
-  cp -a /opt/cloudpc/prism/instance "$PRISM_DIR/instances/Minecraft"
+if [[ ! -f "$INSTANCE_DIR/mmc-pack.json" ]]; then
+  cp -a /opt/cloudpc/prism/instance "$INSTANCE_DIR"
+fi
+
+# Software rendering gets slower with every extra pixel, so the seeded instance
+# opens in a small window. Prism writes OverrideWindow itself as soon as a window
+# size is chosen in the launcher, and from then on these lines are left alone.
+INSTANCE_CFG="$INSTANCE_DIR/instance.cfg"
+if [[ -f "$INSTANCE_CFG" ]] && ! grep -q '^OverrideWindow=' "$INSTANCE_CFG"; then
+  printf 'OverrideWindow=true\nMinecraftWinWidth=960\nMinecraftWinHeight=540\n' >> "$INSTANCE_CFG"
+fi
+
+# Full screen on a 1280x800 software-rendered display costs the most fill rate of
+# all, and the browser already scales the desktop to the device, so keep the game
+# windowed. Only this one in-game setting is touched; everything else is the user's.
+INSTANCE_OPTIONS="$INSTANCE_DIR/options.txt"
+if [[ -f "$INSTANCE_OPTIONS" ]]; then
+  sed -i 's/^fullscreen:true$/fullscreen:false/' "$INSTANCE_OPTIONS"
 fi
 if [[ ! -f "/data/Desktop/Prism Launcher.desktop" ]]; then
   cp /opt/cloudpc/prism/PrismLauncher.desktop "/data/Desktop/Prism Launcher.desktop"
@@ -154,10 +204,13 @@ fi
 export DBUS_SESSION_BUS_ADDRESS="$DBUS_ADDRESS"
 echo "CloudPC: session bus is listening (${DBUS_ADDRESS%%,guid=*})."
 
-echo "CloudPC: starting XFCE desktop..."
+echo "CloudPC: starting XFCE desktop (llvmpipe limited to ${LP_NUM_THREADS} CPU thread(s))..."
 runuser -u cloud -- env HOME=/home/cloud DISPLAY=:0 \
   XDG_RUNTIME_DIR="$XDG_RUNTIME_DIR" \
   DBUS_SESSION_BUS_ADDRESS="$DBUS_ADDRESS" \
+  LP_NUM_THREADS="$LP_NUM_THREADS" \
+  MESA_SHADER_CACHE_DIR="$MESA_SHADER_CACHE_DIR" \
+  MESA_SHADER_CACHE_MAX_SIZE="$MESA_SHADER_CACHE_MAX_SIZE" \
   startxfce4 &
 DESKTOP_PID=$!
 

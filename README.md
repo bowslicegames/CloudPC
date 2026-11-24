@@ -16,6 +16,7 @@ A browser-accessible, lightweight Debian desktop intended for an Altare Docker A
 - Persistent launcher configuration, accounts, instances, worlds, downloads and desktop files under `/data`
 - 1280×800 desktop with larger fonts and cursor for small screens
 - Conservative Java defaults (512 MiB initial, 1.5 GiB maximum)
+- Minecraft instance preconfigured for software rendering: 960×540 window, 4 chunk render distance, fast graphics, no clouds or entity shadows
 - Docker health check and GitHub Actions image-build workflow
 
 ## Build locally
@@ -79,6 +80,29 @@ The instance ships as a descriptor only: Prism Launcher downloads that Minecraft
 - Start with 2–4 chunks render distance, low graphics, no shaders and a small modpack.
 - Close other desktop applications while Minecraft is running.
 - The container's virtual display uses software rendering. `glxinfo -B` can help identify the renderer; if it reports llvmpipe, rendering is CPU-based.
+
+## Minecraft performance
+
+The desktop has no GPU, so Minecraft draws through Mesa's llvmpipe CPU rasteriser. Every frame is calculated on the CPU, and the CPU time the container is allowed is the ceiling: at 125% CPU (about one core) modern Minecraft is a few frames per second no matter which mods are installed.
+
+What CloudPC already does for you:
+
+- `LP_NUM_THREADS` is derived from the container's CPU quota, so llvmpipe uses the cores the app is actually allowed instead of spawning a worker per host core and thrashing.
+- The Mesa shader cache lives in `/data/.cache/mesa`, so shaders compiled by the LLVM JIT survive restarts.
+- The seeded instance opens in a 960×540 window (`instance.cfg`), roughly half the pixels of the 1280×800 desktop.
+- A fresh instance starts at render distance 4, simulation distance 5, fast graphics, smooth lighting off, no clouds, no entity shadows, minimal particles and vsync off.
+- Minecraft is forced out of fullscreen on start. The browser already scales the desktop to the device, and fullscreen is the most expensive case for a CPU rasteriser.
+
+If it is still slow:
+
+1. **Give the app more CPU.** This is the change that scales. 125% is about one core; 300–400% usually makes Minecraft playable, if your team pool has that spare.
+2. In game, **Esc → Options → Video**: keep render distance at 4–6 and simulation distance at 5.
+3. Keep the game window small; a bigger window means more pixels for the CPU to shade.
+4. Close other desktop programs while playing.
+
+About the mods: **Sodium** targets OpenGL 4.5 hardware and replaces Mojang's terrain renderer with GPU-driven drawing, so on a software rasteriser it can be slightly faster or slower than vanilla depending on the scene. If numbers look wrong, try one session with Sodium removed. **FerriteCore** only saves memory and does not change frame rate. Run `glxinfo -B` in a desktop terminal to confirm: when it reports `llvmpipe (LLVM ...)`, the renderer is the CPU.
+
+This does not turn the container into a gaming host. Real frame rates need GPU passthrough or an ordinary machine.
 
 ## Persistence
 
