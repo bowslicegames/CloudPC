@@ -6,8 +6,8 @@ ENV DEBIAN_FRONTEND=noninteractive \
     DISPLAY=:0 \
     VNC_PORT=5900 \
     NOVNC_PORT=8080 \
-    SCREEN_WIDTH=1440 \
-    SCREEN_HEIGHT=900 \
+    SCREEN_WIDTH=1280 \
+    SCREEN_HEIGHT=800 \
     SCREEN_DEPTH=24 \
     JAVA_HOME=/usr/lib/jvm/java-21-openjdk-amd64
 
@@ -26,7 +26,7 @@ RUN printf '%s\n' \
       thunar mousepad dbus dbus-x11 \
       fonts-dejavu fonts-liberation \
       mesa-utils libgl1-mesa-dri libglx-mesa0 \
-      openjdk-21-jre \
+      openjdk-21-jre python3 \
  && apt-get install -y --no-install-recommends -t trixie-backports prismlauncher \
  && apt-get clean \
  && rm -rf /var/lib/apt/lists/* \
@@ -40,7 +40,17 @@ RUN printf '%s\n' \
 COPY entrypoint.sh /opt/cloudpc/entrypoint.sh
 COPY healthcheck.sh /opt/cloudpc/healthcheck.sh
 COPY dbus-session.conf /opt/cloudpc/dbus-session.conf
+COPY prism/ /opt/cloudpc/prism/
+COPY etc/xdg/xfce4/xfconf/xfce-perchannel-xml/ /etc/xdg/xfce4/xfconf/xfce-perchannel-xml/
 COPY index.html /usr/share/novnc/index.html
+
+# Pin the seeded Prism instance to the current Minecraft release when the build
+# has network access; the baked version is kept when Mojang cannot be reached.
+RUN version="$(curl -fsS --max-time 25 https://launchermeta.mojang.com/mc/game/version_manifest_v2.json \
+       | python3 -c 'import json,sys; print(json.load(sys.stdin)["latest"]["release"])' 2>/dev/null || true)" \
+ && case "$version" in ''|*[!0-9A-Za-z._-]*) version="1.21.4" ;; esac \
+ && python3 -c 'import json,sys; path="/opt/cloudpc/prism/instance/mmc-pack.json"; data=json.load(open(path)); data["components"][0]["version"]=sys.argv[1]; json.dump(data, open(path, "w"), indent=2)' "$version" \
+ && echo "CloudPC: Prism instance pinned to Minecraft ${version}"
 
 RUN chmod +x /opt/cloudpc/entrypoint.sh /opt/cloudpc/healthcheck.sh \
  && rm -f /usr/share/novnc/vnc.html /usr/share/novnc/vnc_lite.html

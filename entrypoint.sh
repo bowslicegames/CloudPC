@@ -31,7 +31,38 @@ chown cloud:cloud "$XDG_RUNTIME_DIR"
 chmod 700 "$XDG_RUNTIME_DIR"
 export XDG_RUNTIME_DIR
 
-echo "CloudPC: VNC password authentication is DISABLED."
+# Prism Launcher is preinstalled in the image. Seed a ready-to-run instance and
+# a one-tap desktop shortcut on first boot so the desktop needs no setup.
+PRISM_DIR=/data/.local/share/PrismLauncher
+mkdir -p "$PRISM_DIR/instances"
+if [[ ! -f "$PRISM_DIR/instances/Minecraft/mmc-pack.json" ]]; then
+  cp -a /opt/cloudpc/prism/instance "$PRISM_DIR/instances/Minecraft"
+fi
+if [[ ! -f "/data/Desktop/Prism Launcher.desktop" ]]; then
+  cp /opt/cloudpc/prism/PrismLauncher.desktop "/data/Desktop/Prism Launcher.desktop"
+fi
+chmod +x "/data/Desktop/Prism Launcher.desktop"
+chown -R cloud:cloud "$PRISM_DIR" /data/Desktop
+
+# VNC password: VNC_PASSWORD wins, otherwise the password already stored on the
+# persistent /data mount is reused, otherwise one is generated once and logged.
+# RFB truncates VNC passwords to 8 characters, which is a protocol limitation.
+VNC_PASSWD_FILE=/data/.vnc/passwd
+mkdir -p /data/.vnc
+if [[ -n "${VNC_PASSWORD:-}" ]]; then
+  runuser -u cloud -- env HOME=/home/cloud \
+    x11vnc -storepasswd "$VNC_PASSWORD" "$VNC_PASSWD_FILE" >/dev/null
+  echo "CloudPC: VNC password set from VNC_PASSWORD (stored in ${VNC_PASSWD_FILE})."
+elif [[ -s "$VNC_PASSWD_FILE" ]]; then
+  echo "CloudPC: using the existing VNC password stored in ${VNC_PASSWD_FILE}."
+else
+  GENERATED_VNC_PASSWORD="$(head -c 96 /dev/urandom | tr -dc 'A-Za-z0-9' | cut -c1-8)"
+  runuser -u cloud -- env HOME=/home/cloud \
+    x11vnc -storepasswd "$GENERATED_VNC_PASSWORD" "$VNC_PASSWD_FILE" >/dev/null
+  echo "CloudPC: generated VNC password (shown once): ${GENERATED_VNC_PASSWORD}"
+  echo "CloudPC: set VNC_PASSWORD to choose your own password instead."
+fi
+chown cloud:cloud "$VNC_PASSWD_FILE"
 
 cat > /data/.config/cloudpc-env <<EOF
 JAVA_MIN_RAM=${JAVA_MIN_RAM}
@@ -130,10 +161,10 @@ runuser -u cloud -- env HOME=/home/cloud DISPLAY=:0 \
   startxfce4 &
 DESKTOP_PID=$!
 
-echo "CloudPC: starting password-free VNC server..."
+echo "CloudPC: starting password-protected VNC server..."
 # Keep x11vnc output visible: startup failures must be diagnosable in Altare.
 runuser -u cloud -- env HOME=/home/cloud DISPLAY=:0 \
-  x11vnc -display :0 -nopw -rfbport "${VNC_PORT}" \
+  x11vnc -display :0 -rfbauth "$VNC_PASSWD_FILE" -rfbport "${VNC_PORT}" \
   -forever -shared -noxdamage -repeat -localhost &
 VNC_PID=$!
 
@@ -179,7 +210,7 @@ if [[ "$NOVNC_READY" != "1" ]]; then
   exit 1
 fi
 
-echo "CloudPC: noVNC is listening on port ${NOVNC_PORT}; password authentication is disabled."
+echo "CloudPC: noVNC is listening on port ${NOVNC_PORT}; VNC password authentication is enabled."
 
 # Supervise all core services. If one exits, report which one before shutdown.
 set +e

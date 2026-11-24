@@ -4,58 +4,403 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <meta name="theme-color" content="#101827">
+<meta name="color-scheme" content="dark">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <title>CloudPC</title>
 <style>
-:root{color-scheme:dark;font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
-*{box-sizing:border-box}html,body{margin:0;width:100%;height:100%;overflow:hidden;background:#080d16;color:#f8fafc}
-#toolbar{height:48px;display:flex;align-items:center;justify-content:space-between;padding:0 14px;background:#111c2d;color:#dbeafe;font-size:14px}
-#status{color:#bdc9da}#screen{height:calc(100% - 48px);width:100%;display:flex;align-items:center;justify-content:center;overflow:auto}
-#screen canvas{max-width:100%;max-height:100%}
-button{padding:7px 12px;border:0;border-radius:8px;background:#78a9ff;color:#081326;font:inherit;font-weight:750;cursor:pointer}
+:root{
+  color-scheme:dark;
+  --bar:#111c2d;
+  --bar-text:#dbeafe;
+  --accent:#78a9ff;
+  --accent-ink:#081326;
+  --pad:56px;
+  --action:48px;
+  font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+}
+*{box-sizing:border-box}
+html,body{margin:0;height:100%;overflow:hidden;background:#080d16;color:#f8fafc;overscroll-behavior:none}
+body{display:flex;flex-direction:column;-webkit-tap-highlight-color:transparent;-webkit-user-select:none;user-select:none}
+#toolbar{
+  flex:0 0 auto;display:flex;align-items:center;gap:8px;flex-wrap:wrap;
+  padding:calc(6px + env(safe-area-inset-top)) 10px 6px;background:var(--bar);color:var(--bar-text);font-size:14px;
+}
+#toolbar strong{font-size:15px;letter-spacing:.02em}
+#status{flex:1 1 120px;min-width:0;color:#bdc9da;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+#toolbar .buttons{display:flex;gap:6px;margin-left:auto}
+button{
+  min-width:48px;min-height:48px;padding:0 12px;border:0;border-radius:12px;background:#22304a;color:#e6eefc;
+  font:inherit;font-weight:600;cursor:pointer;display:inline-flex;align-items:center;justify-content:center;touch-action:manipulation;
+}
+button[aria-pressed="true"],button.primary{background:var(--accent);color:var(--accent-ink)}
 #reconnect{display:none}
+#screen{position:relative;flex:1 1 auto;display:flex;align-items:center;justify-content:center;overflow:hidden;background:#000}
+#screen canvas{max-width:100%;max-height:100%;touch-action:none}
+#controls{
+  position:fixed;left:0;right:0;bottom:0;z-index:20;display:grid;
+  grid-template-columns:auto minmax(0,1fr) auto;align-items:end;gap:8px;
+  padding:0 10px calc(10px + env(safe-area-inset-bottom)) 10px;pointer-events:none;
+}
+#controls[hidden]{display:none}
+#controls .pad{display:grid;grid-template-columns:repeat(3,var(--pad));grid-template-rows:repeat(2,var(--pad));gap:6px}
+#controls .pad button{width:var(--pad);height:var(--pad);padding:0;border-radius:16px;background:rgba(34,48,74,.74);font-size:17px;backdrop-filter:blur(6px)}
+#controls .pad button[data-key="KeyW"]{grid-area:1/2}
+#controls .pad button[data-key="KeyA"]{grid-area:2/1}
+#controls .pad button[data-key="KeyS"]{grid-area:2/2}
+#controls .pad button[data-key="KeyD"]{grid-area:2/3}
+#controls .pad button,#controls .actions button,#controls .lookpad{pointer-events:auto;touch-action:none}
+#controls .lookpad{
+  min-height:calc(var(--pad) * 2);border-radius:18px;border:1px dashed rgba(120,169,255,.5);
+  background:rgba(120,169,255,.10);color:#cfe0ff;display:flex;align-items:center;justify-content:center;
+  font-size:12px;line-height:1.35;text-align:center;padding:8px;
+}
+#controls .actions{display:grid;grid-template-columns:repeat(2,minmax(76px,1fr));gap:6px}
+#controls .actions button{min-height:var(--action);border-radius:14px;background:rgba(34,48,74,.74);font-size:12.5px;padding:0 8px;backdrop-filter:blur(6px)}
+#controls button[data-active="1"]{background:var(--accent);color:var(--accent-ink)}
+#passwordPrompt{position:fixed;inset:0;z-index:40;display:grid;place-items:center;padding:20px;background:rgba(8,13,22,.84)}
+#passwordPrompt[hidden]{display:none}
+#passwordPrompt form{width:min(380px,100%);display:grid;gap:12px;padding:20px;border-radius:18px;background:#111c2d;box-shadow:0 20px 44px rgba(0,0,0,.5)}
+#passwordPrompt h1{margin:0;font-size:17px}
+#passwordPrompt p{margin:0;color:#bdc9da;font-size:13px;line-height:1.45}
+#passwordPrompt input{min-height:48px;padding:0 12px;border-radius:12px;border:1px solid #2c3d5a;background:#0b1420;color:#f8fafc;font:inherit}
+#passwordPrompt .row{display:flex;gap:8px;justify-content:flex-end;flex-wrap:wrap}
+#vk{position:fixed;left:0;bottom:0;width:1px;height:1px;padding:0;border:0;opacity:0}
+@media (max-width:480px){
+  :root{--pad:52px;--action:44px}
+  #toolbar{font-size:13px}
+  #toolbar strong{display:none}
+  #controls .lookpad{font-size:11px}
+}
 </style>
 </head>
 <body>
-<div id="toolbar"><strong>CloudPC</strong><span id="status">Connecting to desktop…</span><button id="reconnect" type="button">Reconnect</button></div>
+<header id="toolbar">
+  <strong>CloudPC</strong>
+  <span id="status">Connecting to desktop…</span>
+  <div class="buttons">
+    <button id="keyboardBtn" type="button" title="On-screen keyboard" aria-label="On-screen keyboard">⌨</button>
+    <button id="controlsBtn" type="button" title="Touch controls" aria-label="Touch controls" aria-pressed="false">🎮</button>
+    <button id="fullscreenBtn" type="button" title="Fullscreen" aria-label="Fullscreen">⛶</button>
+    <button id="reconnect" class="primary" type="button">Reconnect</button>
+  </div>
+</header>
+
 <div id="screen"></div>
+
+<div id="controls" hidden>
+  <div class="pad">
+    <button type="button" data-key="KeyW">W</button>
+    <button type="button" data-key="KeyA">A</button>
+    <button type="button" data-key="KeyS">S</button>
+    <button type="button" data-key="KeyD">D</button>
+  </div>
+  <div class="lookpad" id="lookpad">Drag to look<br>Tap to click</div>
+  <div class="actions">
+    <button type="button" data-key="Space">Jump</button>
+    <button type="button" data-key="ShiftLeft">Sneak</button>
+    <button type="button" data-key="ControlLeft">Sprint</button>
+    <button type="button" data-mouse="2">Use</button>
+    <button type="button" data-key="KeyE">Inventory</button>
+    <button type="button" data-key="KeyQ">Drop</button>
+    <button type="button" data-key="Escape">Esc</button>
+    <button type="button" data-key="KeyT">Chat</button>
+  </div>
+</div>
+
+<div id="passwordPrompt" hidden>
+  <form id="passwordForm">
+    <h1>VNC password</h1>
+    <p id="passwordMessage">This desktop is protected by a password.</p>
+    <input id="passwordInput" type="password" autocomplete="current-password" placeholder="Password" aria-label="VNC password">
+    <div class="row">
+      <button id="passwordCancel" type="button">Cancel</button>
+      <button class="primary" type="submit">Connect</button>
+    </div>
+  </form>
+</div>
+
+<textarea id="vk" autocapitalize="off" autocorrect="off" autocomplete="off" spellcheck="false" aria-hidden="true" tabindex="-1"></textarea>
+
 <script type="module">
 import RFB from "/core/rfb.js";
-const screen=document.querySelector("#screen");
-const status=document.querySelector("#status");
-const reconnect=document.querySelector("#reconnect");
-let rfb=null;
-function connect(){
-  if(rfb){try{rfb.disconnect()}catch{};rfb=null;}
-  screen.replaceChildren();
-  reconnect.style.display="none";
-  status.textContent="Connecting to desktop…";
-  try{
-    const scheme=location.protocol==="https:"?"wss":"ws";
-    const connection=new RFB(screen,scheme+"://"+location.host+"/websockify");
-    rfb=connection;
-    connection.scaleViewport=true;
-    connection.resizeSession=false;
-    connection.showDotCursor=true;
-    connection.addEventListener("connect",()=>{status.textContent="Connected";});
-    connection.addEventListener("disconnect",event=>{
-      if(rfb!==connection)return;
-      rfb=null;
-      status.textContent=event.detail?.clean?"Disconnected":"Connection lost";
-      reconnect.style.display="inline-block";
+
+const screenEl = document.querySelector("#screen");
+const statusEl = document.querySelector("#status");
+const reconnectBtn = document.querySelector("#reconnect");
+const keyboardBtn = document.querySelector("#keyboardBtn");
+const controlsBtn = document.querySelector("#controlsBtn");
+const fullscreenBtn = document.querySelector("#fullscreenBtn");
+const controlsEl = document.querySelector("#controls");
+const lookpad = document.querySelector("#lookpad");
+const vk = document.querySelector("#vk");
+const passwordPrompt = document.querySelector("#passwordPrompt");
+const passwordForm = document.querySelector("#passwordForm");
+const passwordInput = document.querySelector("#passwordInput");
+const passwordMessage = document.querySelector("#passwordMessage");
+const passwordCancel = document.querySelector("#passwordCancel");
+
+let rfb = null;
+let canvas = null;
+let cursor = null;
+
+/* ---------- keysyms ---------- */
+const CODE_KEYSYMS = {
+  Space: 0x0020, Escape: 0xff1b, Enter: 0xff0d, NumpadEnter: 0xff0d, Tab: 0xff09,
+  Backspace: 0xff08, Delete: 0xffff,
+  ArrowLeft: 0xff51, ArrowUp: 0xff52, ArrowRight: 0xff53, ArrowDown: 0xff54,
+  ShiftLeft: 0xffe1, ShiftRight: 0xffe2, ControlLeft: 0xffe3, ControlRight: 0xffe4,
+  AltLeft: 0xffe9, AltRight: 0xffea, MetaLeft: 0xffeb, MetaRight: 0xffec,
+  Home: 0xff50, End: 0xff57, PageUp: 0xff55, PageDown: 0xff56,
+  F1: 0xffbe, F2: 0xffbf, F3: 0xffc0, F4: 0xffc1, F5: 0xffc2, F6: 0xffc3,
+};
+
+function charKeysym(ch) {
+  const cp = ch.codePointAt(0);
+  if (cp >= 0x20 && cp <= 0x7e) return cp;
+  return 0x01000000 | cp;
+}
+
+function keysymForCode(code) {
+  if (CODE_KEYSYMS[code] !== undefined) return CODE_KEYSYMS[code];
+  if (code.startsWith("Key")) return code.charCodeAt(3) + 0x20;
+  if (code.startsWith("Digit")) return code.charCodeAt(5);
+  return 0;
+}
+
+function keyDown(keysym, code) { if (rfb) rfb.sendKey(keysym, code || null, true); }
+function keyUp(keysym, code) { if (rfb) rfb.sendKey(keysym, code || null, false); }
+function tapKey(keysym, code) { if (rfb) rfb.sendKey(keysym, code || null); }
+
+/* ---------- on-screen keyboard ---------- */
+keyboardBtn.addEventListener("click", () => {
+  if (document.activeElement === vk) {
+    vk.blur();
+  } else {
+    vk.value = "";
+    vk.focus();
+  }
+});
+
+vk.addEventListener("keydown", event => {
+  const keysym = CODE_KEYSYMS[event.code];
+  if (keysym === undefined) return; /* printable characters arrive via `input` */
+  event.preventDefault();
+  tapKey(keysym, event.code);
+});
+
+vk.addEventListener("input", () => {
+  const text = vk.value;
+  vk.value = "";
+  for (const ch of text) tapKey(charKeysym(ch), null);
+});
+
+/* ---------- fullscreen ---------- */
+fullscreenBtn.addEventListener("click", async () => {
+  try {
+    if (document.fullscreenElement) await document.exitFullscreen();
+    else await document.documentElement.requestFullscreen();
+  } catch {
+    /* browsers without fullscreen support simply ignore this */
+  }
+});
+
+/* ---------- touch controls ---------- */
+controlsBtn.addEventListener("click", () => {
+  const show = controlsEl.hidden;
+  controlsEl.hidden = !show;
+  controlsBtn.setAttribute("aria-pressed", String(show));
+});
+
+for (const button of controlsEl.querySelectorAll("button[data-key]")) {
+  const code = button.dataset.key;
+  const keysym = keysymForCode(code);
+
+  button.addEventListener("pointerdown", event => {
+    event.preventDefault();
+    if (button.setPointerCapture) button.setPointerCapture(event.pointerId);
+    button.dataset.active = "1";
+    keyDown(keysym, code);
+  });
+
+  const release = () => {
+    if (button.dataset.active !== "1") return;
+    delete button.dataset.active;
+    keyUp(keysym, code);
+  };
+  button.addEventListener("pointerup", release);
+  button.addEventListener("pointercancel", release);
+  button.addEventListener("lostpointercapture", release);
+}
+
+/* mouse helpers: noVNC maps canvas mouse events, so dispatch them for it */
+function canvasRect() { return canvas ? canvas.getBoundingClientRect() : null; }
+
+function clampToCanvas(x, y) {
+  const rect = canvasRect();
+  if (!rect) return { x, y };
+  return {
+    x: Math.min(Math.max(x, rect.left + 1), rect.right - 1),
+    y: Math.min(Math.max(y, rect.top + 1), rect.bottom - 1),
+  };
+}
+
+function dispatchMouse(type, x, y, buttons, button) {
+  if (!canvas) return;
+  canvas.dispatchEvent(new MouseEvent(type, {
+    clientX: x, clientY: y, buttons, button: button || 0,
+    bubbles: true, cancelable: true, view: window,
+  }));
+}
+
+function ensureCursor() {
+  if (cursor) return cursor;
+  const rect = canvasRect();
+  if (!rect) return null;
+  cursor = { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
+  return cursor;
+}
+
+function moveCursorBy(dx, dy) {
+  const position = ensureCursor();
+  if (!position) return;
+  const next = clampToCanvas(position.x + dx, position.y + dy);
+  cursor = next;
+  dispatchMouse("mousemove", next.x, next.y, 0, 0);
+}
+
+function clickMouse(button) {
+  const position = ensureCursor();
+  if (!position) return;
+  const mask = button === 2 ? 2 : 1;
+  dispatchMouse("mousemove", position.x, position.y, 0, button || 0);
+  dispatchMouse("mousedown", position.x, position.y, mask, button || 0);
+  dispatchMouse("mouseup", position.x, position.y, 0, button || 0);
+}
+
+const LOOK_GAIN = 1.6;
+let look = null;
+
+lookpad.addEventListener("pointerdown", event => {
+  event.preventDefault();
+  if (lookpad.setPointerCapture) lookpad.setPointerCapture(event.pointerId);
+  look = { id: event.pointerId, x: event.clientX, y: event.clientY, moved: 0 };
+});
+
+lookpad.addEventListener("pointermove", event => {
+  if (!look || event.pointerId !== look.id) return;
+  event.preventDefault();
+  const dx = event.clientX - look.x;
+  const dy = event.clientY - look.y;
+  look.x = event.clientX;
+  look.y = event.clientY;
+  look.moved += Math.abs(dx) + Math.abs(dy);
+  moveCursorBy(dx * LOOK_GAIN, dy * LOOK_GAIN);
+});
+
+function endLook(event) {
+  if (!look || event.pointerId !== look.id) return;
+  const moved = look.moved;
+  look = null;
+  if (moved < 10) clickMouse(0);
+}
+lookpad.addEventListener("pointerup", endLook);
+lookpad.addEventListener("pointercancel", endLook);
+
+/* right click button */
+for (const button of controlsEl.querySelectorAll("button[data-mouse]")) {
+  button.addEventListener("pointerdown", event => {
+    event.preventDefault();
+    button.dataset.active = "1";
+    clickMouse(Number(button.dataset.mouse));
+  });
+  const release = () => { delete button.dataset.active; };
+  button.addEventListener("pointerup", release);
+  button.addEventListener("pointercancel", release);
+}
+
+/* ---------- password prompt ---------- */
+function showPasswordPrompt(message) {
+  passwordMessage.textContent = message;
+  passwordPrompt.hidden = false;
+  passwordInput.value = "";
+  passwordInput.focus();
+}
+
+passwordForm.addEventListener("submit", event => {
+  event.preventDefault();
+  passwordPrompt.hidden = true;
+  if (rfb) rfb.sendCredentials({ password: passwordInput.value });
+});
+
+passwordCancel.addEventListener("click", () => {
+  passwordPrompt.hidden = true;
+  if (rfb) rfb.disconnect();
+});
+
+/* ---------- connection ---------- */
+function connect() {
+  if (rfb) {
+    try { rfb.disconnect(); } catch { /* already gone */ }
+    rfb = null;
+  }
+  canvas = null;
+  cursor = null;
+  passwordPrompt.hidden = true;
+  screenEl.replaceChildren();
+  reconnectBtn.style.display = "none";
+  statusEl.textContent = "Connecting to desktop…";
+
+  try {
+    const scheme = location.protocol === "https:" ? "wss" : "ws";
+    const connection = new RFB(screenEl, scheme + "://" + location.host + "/websockify");
+    rfb = connection;
+    canvas = connection._canvas || screenEl.querySelector("canvas");
+
+    connection.scaleViewport = true;
+    connection.resizeSession = false;
+    connection.showDotCursor = true;
+    connection.viewOnly = false;
+    connection.dragViewport = false;
+
+    connection.addEventListener("connect", () => {
+      canvas = connection._canvas || screenEl.querySelector("canvas");
+      statusEl.textContent = "Connected";
+      reconnectBtn.style.display = "none";
     });
-    connection.addEventListener("securityfailure",event=>{
-      if(rfb!==connection)return;
-      rfb=null;
-      status.textContent="Connection rejected: "+(event.detail?.reason||"security negotiation failed");
-      reconnect.style.display="inline-block";
+
+    connection.addEventListener("credentialsrequired", () => {
+      if (rfb !== connection) return;
+      statusEl.textContent = "Password required";
+      showPasswordPrompt("Enter the VNC password for this desktop.");
     });
-  }catch(error){
-    rfb=null;
-    status.textContent="Could not connect: "+(error?.message||"unknown error");
-    reconnect.style.display="inline-block";
+
+    connection.addEventListener("disconnect", event => {
+      if (rfb !== connection) return;
+      rfb = null;
+      canvas = null;
+      statusEl.textContent = event.detail?.clean ? "Disconnected" : "Connection lost";
+      reconnectBtn.style.display = "inline-flex";
+    });
+
+    connection.addEventListener("securityfailure", event => {
+      if (rfb !== connection) return;
+      rfb = null;
+      canvas = null;
+      statusEl.textContent = "Connection rejected";
+      showPasswordPrompt("The desktop rejected the connection: " +
+        (event.detail?.reason || "security negotiation failed") + ". Try again.");
+    });
+  } catch (error) {
+    rfb = null;
+    canvas = null;
+    statusEl.textContent = "Could not connect: " + (error?.message || "unknown error");
+    reconnectBtn.style.display = "inline-flex";
   }
 }
-reconnect.addEventListener("click",connect);
+
+reconnectBtn.addEventListener("click", connect);
 connect();
 </script>
 </body>
