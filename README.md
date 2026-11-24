@@ -9,7 +9,7 @@ A browser-accessible, lightweight Debian desktop intended for an Altare Docker A
 - Debian 13 base
 - XFCE desktop, Thunar file manager and terminal
 - noVNC browser access
-- VNC password authentication
+- No VNC password: access is unauthenticated (see Security notes)
 - Prism Launcher from Debian trixie-backports
 - OpenJDK 21 runtime
 - Persistent launcher configuration, accounts, instances, worlds, downloads and desktop files under `/data`
@@ -23,11 +23,10 @@ docker build -t cloudpc:latest .
 docker run --rm -it \
   -p 8080:8080 \
   -v cloudpc-data:/data \
-  -e VNC_PASSWORD='choose-a-long-password' \
   cloudpc:latest
 ```
 
-Open `http://localhost:8080`. Use the VNC password you supplied.
+Open `http://localhost:8080`. No VNC password is required or configured.
 
 For local testing, the image needs an x86-64 Linux host for the included Prism/Java package combination. The GitHub Actions workflow builds `linux/amd64`.
 
@@ -40,18 +39,17 @@ For local testing, the image needs an x86-64 Linux host for the included Prism/J
 5. Set the container port to `8080`.
 6. Set the app resource limits. Start with **4096 MB RAM**, **125% CPU**, and the largest disk allocation you can spare. Your team pool is shared, so make sure other servers still have resources.
 7. Configure persistent storage for `/data` if the Docker App offers a persistent volume/mount. **Do not assume the container filesystem survives image redeploys.** If persistent mounts are not available for your selected Altare app type, use an Altare-supported persistent storage service or a Debian sandbox instead; do not store your only Minecraft worlds in the disposable container layer.
-8. Set `VNC_PASSWORD` as an environment variable before first start. Use a unique password, not your Microsoft password.
+8. Keep the app private. There is no `VNC_PASSWORD` and no login step: anyone who can reach the app port gets full control of the desktop. Do not publish the address or share it with untrusted people; use a private network, VPN or an authenticated reverse proxy in front of it if it is internet-facing.
 9. Start the app and open its HTTPS address. If the page does not load, check the app logs and confirm that port `8080` is exposed.
 
 
 ## First launch
 
 1. Open the CloudPC web address.
-2. Select **Open desktop**.
-3. Enter the VNC password.
-4. Open Prism Launcher from the XFCE applications menu.
-5. Add your Microsoft account inside Prism Launcher. Microsoft authentication is handled by Prism Launcher; CloudPC does not collect your credentials.
-6. Create a Minecraft instance and choose its Java runtime. Select the installed Java 21 executable:
+2. The desktop connects straight away; there is no VNC password to enter.
+3. Open Prism Launcher from the XFCE applications menu.
+4. Add your Microsoft account inside Prism Launcher. Microsoft authentication is handled by Prism Launcher; CloudPC does not collect your credentials.
+5. Create a Minecraft instance and choose its Java runtime. Select the installed Java 21 executable:
    `/usr/lib/jvm/java-21-openjdk-amd64/bin/java`
 
 ## Resource recommendations for a 6 GB / 150% CPU team pool
@@ -71,15 +69,14 @@ The following user data is stored beneath `/data`:
 - `/data/.config`
 - `/data/Desktop`
 - `/data/Downloads`
-- `/data/.vnc/passwd`
 
-Back up `/data` regularly. The VNC password is generated once on first boot if `VNC_PASSWORD` is not set, printed once in the startup logs, and then retained in `/data/.vnc/passwd`. Set a new `VNC_PASSWORD` only when you intentionally want to rotate it.
+Back up `/data` regularly. No VNC password file is stored: the desktop is served without authentication.
 
 ## Security notes
 
-- Keep the VNC password private and use a unique password.
+- There is no VNC password. Anyone who can reach port `8080` can control the desktop and read files stored under `/data`.
 - Do not expose the VNC port `5900`; only expose the noVNC web port `8080`.
-- Do not share the desktop URL with untrusted people. Anyone with access and the VNC password can control the desktop and access files stored there.
+- Do not share the desktop URL with untrusted people. If the app is internet-facing, put it behind a private network, VPN or an authenticated reverse proxy.
 - Never store Microsoft credentials in environment variables or commit them to Git.
 - Use HTTPS as provided by Altare's public app endpoint.
 

@@ -23,6 +23,14 @@ done
 chown -h cloud:cloud /home/cloud/.minecraft /home/cloud/.local \
   /home/cloud/.config /home/cloud/Desktop /home/cloud/Downloads
 
+# GLib/GTK and D-Bus expect a private runtime directory owned by the desktop
+# user; without one they fall back to /tmp and log warnings.
+XDG_RUNTIME_DIR="/run/user/$(id -u cloud)"
+mkdir -p "$XDG_RUNTIME_DIR"
+chown cloud:cloud "$XDG_RUNTIME_DIR"
+chmod 700 "$XDG_RUNTIME_DIR"
+export XDG_RUNTIME_DIR
+
 echo "CloudPC: VNC password authentication is DISABLED."
 
 cat > /data/.config/cloudpc-env <<EOF
@@ -32,12 +40,13 @@ EOF
 chown cloud:cloud /data/.config/cloudpc-env
 
 XVFB_PID=""
+DBUS_PID=""
 DESKTOP_PID=""
 VNC_PID=""
 NOVNC_PID=""
 cleanup() {
   trap - EXIT INT TERM
-  for pid in "$NOVNC_PID" "$VNC_PID" "$DESKTOP_PID" "$XVFB_PID"; do
+  for pid in "$NOVNC_PID" "$VNC_PID" "$DESKTOP_PID" "$DBUS_PID" "$XVFB_PID"; do
     if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
       kill "$pid" 2>/dev/null || true
     fi
@@ -78,9 +87,47 @@ if [[ "$DISPLAY_READY" != "1" ]]; then
   exit 1
 fi
 
+# Session bus on loopback TCP: on a unix socket GDBus always sends
+# SCM_CREDENTIALS first, which sandboxed runtimes reject with EPERM. That is the
+# "Unable to contact settings server ... Operation not permitted" dialog: xfconfd
+# and xfsettingsd could never reach the bus. Over TCP no credentials are sent.
+echo "CloudPC: starting session D-Bus on loopback TCP..."
+DBUS_ADDRESS_FILE=/tmp/cloudpc-dbus-address
+rm -f "$DBUS_ADDRESS_FILE"
+: > "$DBUS_ADDRESS_FILE"
+chown cloud:cloud "$DBUS_ADDRESS_FILE"
+runuser -u cloud -- env HOME=/home/cloud DISPLAY=:0 \
+  XDG_RUNTIME_DIR="$XDG_RUNTIME_DIR" \
+  dbus-daemon --config-file=/opt/cloudpc/dbus-session.conf \
+  --nofork --print-address=1 >"$DBUS_ADDRESS_FILE" &
+DBUS_PID=$!
+
+DBUS_ADDRESS=""
+for _ in $(seq 1 40); do
+  if ! kill -0 "$DBUS_PID" 2>/dev/null; then
+    echo "ERROR: dbus-daemon exited during startup."
+    wait "$DBUS_PID" || true
+    exit 1
+  fi
+  DBUS_ADDRESS="$(head -n1 "$DBUS_ADDRESS_FILE" 2>/dev/null || true)"
+  if [[ "$DBUS_ADDRESS" == tcp:host=* ]]; then
+    break
+  fi
+  DBUS_ADDRESS=""
+  sleep 0.25
+done
+if [[ -z "$DBUS_ADDRESS" ]]; then
+  echo "ERROR: dbus-daemon did not report a bus address."
+  exit 1
+fi
+export DBUS_SESSION_BUS_ADDRESS="$DBUS_ADDRESS"
+echo "CloudPC: session bus is listening (${DBUS_ADDRESS%%,guid=*})."
+
 echo "CloudPC: starting XFCE desktop..."
 runuser -u cloud -- env HOME=/home/cloud DISPLAY=:0 \
-  dbus-run-session -- startxfce4 &
+  XDG_RUNTIME_DIR="$XDG_RUNTIME_DIR" \
+  DBUS_SESSION_BUS_ADDRESS="$DBUS_ADDRESS" \
+  startxfce4 &
 DESKTOP_PID=$!
 
 echo "CloudPC: starting password-free VNC server..."
@@ -136,10 +183,10 @@ echo "CloudPC: noVNC is listening on port ${NOVNC_PORT}; password authentication
 
 # Supervise all core services. If one exits, report which one before shutdown.
 set +e
-wait -n "$XVFB_PID" "$DESKTOP_PID" "$VNC_PID" "$NOVNC_PID"
+wait -n "$XVFB_PID" "$DBUS_PID" "$DESKTOP_PID" "$VNC_PID" "$NOVNC_PID"
 status=$?
 set -e
-for name in XVFB DESKTOP VNC NOVNC; do
+for name in XVFB DBUS DESKTOP VNC NOVNC; do
   pidvar="${name}_PID"
   pid="${!pidvar}"
   if [[ -n "$pid" ]] && ! kill -0 "$pid" 2>/dev/null; then

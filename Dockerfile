@@ -23,7 +23,7 @@ RUN printf '%s\n' \
       ca-certificates curl wget gnupg \
       xvfb x11vnc novnc websockify x11-utils \
       xfce4-session xfce4-panel xfce4-terminal xfdesktop4 xfwm4 \
-      thunar mousepad dbus-x11 \
+      thunar mousepad dbus dbus-x11 \
       fonts-dejavu fonts-liberation \
       mesa-utils libgl1-mesa-dri libglx-mesa0 \
       openjdk-21-jre \
@@ -39,6 +39,7 @@ RUN printf '%s\n' \
 
 COPY entrypoint.sh /opt/cloudpc/entrypoint.sh
 COPY healthcheck.sh /opt/cloudpc/healthcheck.sh
+COPY dbus-session.conf /opt/cloudpc/dbus-session.conf
 COPY index.html /usr/share/novnc/index.html
 
 RUN chmod +x /opt/cloudpc/entrypoint.sh /opt/cloudpc/healthcheck.sh \
