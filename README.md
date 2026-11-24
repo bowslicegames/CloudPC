@@ -15,9 +15,9 @@ A browser-accessible, lightweight Debian desktop intended for an Altare Docker A
 - Prism Launcher from Debian trixie-backports, preinstalled with a ready-to-run Minecraft instance and a one-tap desktop shortcut
 - OpenJDK 21 runtime
 - Persistent launcher configuration, accounts, instances, worlds, downloads and desktop files under `/data`
-- 1280×800 desktop with larger fonts and cursor for small screens
+- A 1024×640 desktop with larger fonts and a big cursor for small screens; the browser upscales the stream to the device
 - Conservative Java defaults (512 MiB initial, 1.5 GiB maximum)
-- Minecraft instance preconfigured for software rendering: 800×450 window, 2.5 GiB heap, 4 chunk render distance, fast graphics, no clouds or entity shadows
+- Minecraft instance preconfigured for software rendering: a 960×540 window filling most of the desktop, 2.5 GiB heap, 3 chunk render distance, fast graphics, no clouds or entity shadows
 - Docker health check and GitHub Actions image-build workflow
 
 ## Build locally
@@ -75,7 +75,7 @@ The instance ships as a descriptor only: Prism Launcher downloads that Minecraft
   - **LMB** and **RMB** (bottom row, under your thumb) stay held down while your finger is on them, which is what mining a block, attacking or placing a stack needs. **Jump** is next to them, and **Drop**, **Chat**, **Esc**, **Sneak**, **Sprint** and **Inv** fill the two rows above, all press-and-hold.
   - The **Look speed** slider above the buttons sets how far the view turns per pixel of finger travel: `1.0` follows your finger exactly, the default `0.45` is slower because Minecraft applies its own mouse sensitivity on top. The value is remembered per browser, so tune it on the device you play on. Because turning follows your finger at a steady rate instead of accelerating the longer you hold it, a value you tuned on an older build may feel slow — raise the slider a notch.
 - **⛶** toggles fullscreen. The toolbar and overlay respect phone safe areas.
-- The desktop defaults to 1280×800 with 120 DPI fonts and a 24 px cursor for touch targets; override with `SCREEN_WIDTH` / `SCREEN_HEIGHT`. Window compositing is off because rendering is CPU-based.
+- The desktop defaults to 1024×640 with 120 DPI fonts and a 24 px cursor for touch targets; override with `SCREEN_WIDTH` / `SCREEN_HEIGHT`. Window compositing is off because rendering is CPU-based.
 
 ## Resource recommendations for a 6 GB / 150% CPU team pool
 
@@ -93,9 +93,10 @@ What CloudPC already does for you:
 
 - `LP_NUM_THREADS` is derived from the container's CPU quota, so llvmpipe uses the cores the app is actually allowed instead of spawning a worker per host core and thrashing.
 - The Mesa shader cache lives in `/data/.cache/mesa`, so shaders compiled by the LLVM JIT survive restarts.
-- The seeded instance opens in an 800×450 window (`instance.cfg`), a third of the pixels of the 1280×800 desktop, with a 2.5 GiB heap because 1.21.x plus mods thrashes a 1.5 GiB heap.
+- The desktop itself runs at 1024×640 rather than 1280×800: fewer pixels for llvmpipe to fill and for x11vnc to encode, and the browser upscales the stream to the device, so the smaller framebuffer is nearly free to look at.
+- The seeded instance opens in a 960×540 window (`instance.cfg`) that fills most of that desktop, with a 2.5 GiB heap because 1.21.x plus mods thrashes a 1.5 GiB heap. A larger window is affordable because the world is shaded at a lower RenderScale factor.
 - A fresh instance starts at render distance 3, simulation distance 4, fast graphics, smooth lighting off, no clouds, no entity shadows, minimal particles and vsync off.
-- The image ships **RenderScale** 1.3.6 with the Cloth Config it needs, preset to `scale: 0.5`: the world is drawn at half the window resolution and upscaled, so terrain costs a quarter of the pixels while the HUD stays sharp. The jars are only added to instances that are NeoForge 1.21.11 with NeoForge 21.11.6 or newer (the builds are pinned to that version, and a mismatched loader mod stops Minecraft from starting), and never when the instance already has its own build of the same mod. Change the factor in game under **Mods → RenderScale → Config → Scale factor** (0.4 or 0.33 goes further), or delete both jars from `<instance>/.minecraft/mods`. Set `RENDERSCALE=0` in the app environment to stop CloudPC adding them at all.
+- The image ships **RenderScale** 1.3.6 with the Cloth Config it needs, preset to `scale: 0.4`: the world is drawn at 40% of the window resolution and upscaled, so terrain costs about a sixth of the pixels while the HUD stays sharp at full size. The jars are only added to instances that are NeoForge 1.21.11 with NeoForge 21.11.6 or newer (the builds are pinned to that version, and a mismatched loader mod stops Minecraft from starting), and never when the instance already has its own build of the same mod. Change the factor in game under **Mods → RenderScale → Config → Scale factor** (0.33 or 0.25 goes further), or delete both jars from `<instance>/.minecraft/mods`. A factor CloudPC did not write is never overwritten. Set `RENDERSCALE=0` in the app environment to stop CloudPC adding them at all.
 - Minecraft is forced out of fullscreen on start. The browser already scales the desktop to the device, and fullscreen is the most expensive case for a CPU rasteriser.
 
 ### What the browser does, and what it cannot do
@@ -104,13 +105,13 @@ Minecraft's own rendering cannot be moved into the iPad or phone browser: the ga
 
 Everything around that picture is already offloaded, and CloudPC pushes what is left towards the browser:
 
-- noVNC decompresses each update and scales the 1280×800 desktop to the device in the browser. Compositing, scaling and upsampling cost the container nothing.
+- noVNC decompresses each update and scales the 1024×640 desktop to the device in the browser. Compositing, scaling and upsampling cost the container nothing.
 - The **stream quality** button in the toolbar (Fast → Balanced → Sharp) decides how much of the picture compression is left to the desktop. **Fast** (the default) asks x11vnc for no zlib compression and lower JPEG quality: the container stops spending CPU on compression while the browser decodes a larger stream and upscales it. That is the right trade while the CPU is the bottleneck, which it is here, at the cost of bandwidth. **Balanced** is noVNC's usual setting and **Sharp** compresses hardest for the smallest stream and the most server CPU. The choice is remembered per browser.
 - The look pad and the trackpad send at most one pointer event per animation frame, and the look pad one per 50 ms, because Minecraft only reads the mouse 20 times a second. The desktop gets a fraction of the input events it used to have to process.
 
 What this does not do is make the CPU draw faster. If you want the frame rate up, the levers are still more CPU for the app, a smaller game window and a lower RenderScale factor.
 
-How the numbers behave: at `scale 0.5` the terrain shader has a quarter of the pixels to shade, which typically turns 5 fps into 12–18 fps. Nothing reaches 30 fps on one core, because independent of pixel count the CPU also has to build chunk meshes, tick the world, run the JVM's GC and encode the VNC stream, and those do not shrink with resolution.
+How the numbers behave: at `scale 0.4` the world in a 960×540 window is shaded over about 83,000 pixels, which is slightly *fewer* than the old 800×450 window at `scale 0.5` (90,000). So the bigger picture costs roughly what the small one did: the win came from rendering less, not from showing less. The HUD and the final upscale do grow with the window, while the streamed desktop shrank to 1024×640, so expect roughly the same frame rate at a larger, softer picture rather than a faster one. Nothing reaches 30 fps on one core, because independent of pixel count the CPU also has to build chunk meshes, tick the world, run the JVM's GC and encode the VNC stream, and those do not shrink with resolution.
 
 If it is still slow:
 
@@ -125,7 +126,7 @@ About the mods: **Sodium** targets OpenGL 4.5 hardware and replaces Mojang's ter
 
 ### Stale halves or torn pictures
 
-If parts of the picture stop updating — a stale half of a window, or a torn frame while the game redraws — x11vnc is polling the framebuffer instead of using the XDAMAGE extension. Polling re-reads the whole 1280×800 screen every pass, which on ~1 CPU catches only part of each redraw and competes with Minecraft for CPU. CloudPC uses XDAMAGE by default, so only the rectangles that actually changed are read and sent, and updates leave within 5 ms (`-wait 5 -defer 5`). If some GL application ever stops updating the picture under XDAMAGE, set the app environment variable `VNC_NO_DAMAGE=1` to return to full-screen polling.
+If parts of the picture stop updating — a stale half of a window, or a torn frame while the game redraws — x11vnc is polling the framebuffer instead of using the XDAMAGE extension. Polling re-reads the whole 1024×640 screen every pass, which on ~1 CPU catches only part of each redraw and competes with Minecraft for CPU. CloudPC uses XDAMAGE by default, so only the rectangles that actually changed are read and sent, and updates leave within 5 ms (`-wait 5 -defer 5`). If some GL application ever stops updating the picture under XDAMAGE, set the app environment variable `VNC_NO_DAMAGE=1` to return to full-screen polling.
 
 This does not turn the container into a gaming host. Real frame rates need GPU passthrough or an ordinary machine.
 

@@ -610,8 +610,8 @@ for (const button of controlsEl.querySelectorAll("button[data-key]")) {
 }
 
 /* Look speed is measured in screen pixels per CSS pixel of travel, so it means the
- * same on a phone and on a desktop browser no matter how far the 1280 px desktop is
- * scaled down. 1.0 follows the finger exactly; the default is slower on purpose
+ * same on a phone and on a desktop browser no matter how far the desktop is scaled
+ * down in the browser. 1.0 follows the finger exactly; the default is slower on purpose
  * because Minecraft applies its own mouse sensitivity on top. */
 const lookSpeed = document.querySelector("#lookSpeed");
 const LOOK_SPEED_KEY = "cloudpc.lookSpeed";

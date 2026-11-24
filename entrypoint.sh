@@ -3,8 +3,8 @@ set -Eeuo pipefail
 
 : "${NOVNC_PORT:=8080}"
 : "${VNC_PORT:=5900}"
-: "${SCREEN_WIDTH:=1440}"
-: "${SCREEN_HEIGHT:=900}"
+: "${SCREEN_WIDTH:=1024}"
+: "${SCREEN_HEIGHT:=640}"
 : "${SCREEN_DEPTH:=24}"
 : "${JAVA_MIN_RAM:=512M}"
 : "${JAVA_MAX_RAM:=1536M}"
@@ -81,9 +81,9 @@ if [[ -f "$INSTANCE_CFG" ]] && ! grep -q '^OverrideWindow=' "$INSTANCE_CFG"; the
   printf 'OverrideWindow=true\nMinecraftWinWidth=960\nMinecraftWinHeight=540\n' >> "$INSTANCE_CFG"
 fi
 
-# Full screen on a 1280x800 software-rendered display costs the most fill rate of
-# all, and the browser already scales the desktop to the device, so keep the game
-# windowed. Only this one in-game setting is touched; everything else is the user's.
+# Full screen on a software-rendered display costs the most fill rate of all, and
+# the browser already scales the desktop to the device, so keep the game windowed.
+# Only this one in-game setting is touched; everything else is the user's.
 INSTANCE_OPTIONS="$INSTANCE_DIR/options.txt"
 if [[ -f "$INSTANCE_OPTIONS" ]]; then
   sed -i 's/^fullscreen:true$/fullscreen:false/' "$INSTANCE_OPTIONS"
@@ -98,12 +98,14 @@ set_instance_default() {
     echo "CloudPC: instance default ${key} ${from} -> ${to}"
   fi
 }
-# 1.21.x with mods needs more heap than 1.5 GiB; a smaller window is cheaper to
-# render on llvmpipe because every pixel is shaded on the CPU.
+# 1.21.x with mods needs more heap than 1.5 GiB.
 set_instance_default MinMemAlloc 512 1024
 set_instance_default MaxMemAlloc 1536 2560
-set_instance_default MinecraftWinWidth 960 800
-set_instance_default MinecraftWinHeight 540 450
+# The desktop shrank to 1024x640 so the game window can be bigger (960x540, most
+# of the screen) while the world is shaded at a lower RenderScale factor below.
+# The old 800x450 preset is moved forward; a size chosen in Prism is left alone.
+set_instance_default MinecraftWinWidth 800 960
+set_instance_default MinecraftWinHeight 450 540
 
 # Same idea for options.txt: terrain shading dominates the frame cost, so the
 # seeded view and simulation radius stay small. Both are in-game sliders.
@@ -169,8 +171,28 @@ install_renderscale() {
     echo "CloudPC: added $base to ${name}"
   done
   if [[ ! -e "$config" ]]; then
-    printf '{\n  "scale": 0.5,\n  "forceLinear": false,\n  "irisScale": -1.0\n}\n' > "$config"
-    echo "CloudPC: RenderScale preset to 0.5 for ${name}"
+    printf '{\n  "scale": 0.4,\n  "forceLinear": false,\n  "irisScale": -1.0\n}\n' > "$config"
+    echo "CloudPC: RenderScale preset to 0.4 for ${name}"
+  fi
+  # The preset is 0.4 since the game window grew from 800x450 to 960x540: the world
+  # is still shaded at roughly the old pixel count, just displayed bigger. Only a
+  # config that is still exactly what CloudPC wrote is moved; any other value is a
+  # factor the user picked in Mods -> RenderScale -> Config and stays as it is.
+  if [[ -f "$config" ]]; then
+    python3 - "$config" <<'PY'
+import json, sys
+path = sys.argv[1]
+old = {"scale": 0.5, "forceLinear": False, "irisScale": -1.0}
+try:
+    data = json.load(open(path))
+except (OSError, ValueError):
+    raise SystemExit(0)
+if data == old:
+    old["scale"] = 0.4
+    with open(path, "w") as handle:
+        json.dump(old, handle, indent=2)
+    print("CloudPC: RenderScale preset moved from 0.5 to 0.4")
+PY
   fi
 }
 

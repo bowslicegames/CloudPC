@@ -6,8 +6,8 @@ ENV DEBIAN_FRONTEND=noninteractive \
     DISPLAY=:0 \
     VNC_PORT=5900 \
     NOVNC_PORT=8080 \
-    SCREEN_WIDTH=1280 \
-    SCREEN_HEIGHT=800 \
+    SCREEN_WIDTH=1024 \
+    SCREEN_HEIGHT=640 \
     SCREEN_DEPTH=24 \
     JAVA_HOME=/usr/lib/jvm/java-21-openjdk-amd64
 
