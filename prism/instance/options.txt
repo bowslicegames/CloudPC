@@ -1,5 +1,5 @@
-renderDistance:4
-simulationDistance:5
+renderDistance:3
+simulationDistance:4
 graphicsMode:0
 ao:false
 renderClouds:false

@@ -44,6 +44,22 @@ COPY prism/ /opt/cloudpc/prism/
 COPY etc/xdg/xfce4/xfconf/xfce-perchannel-xml/ /etc/xdg/xfce4/xfconf/xfce-perchannel-xml/
 COPY index.html /usr/share/novnc/index.html
 
+# Minecraft shades every pixel of its window on the CPU here, so the only large
+# lever left is drawing the world at a fraction of the window resolution. These
+# are the pinned RenderScale builds (plus the Cloth Config it requires) for the
+# Minecraft/NeoForge the instance is seeded with; the entrypoint copies them into
+# the instance on boot. A failed download only means an unmodified instance.
+RUN mkdir -p /opt/cloudpc/mods \
+ && ( curl -fsSL --max-time 120 -o /opt/cloudpc/mods/renderscale-neoforge-1.21.11-1.3.6.jar \
+        'https://cdn.modrinth.com/data/Va8PJBFX/versions/RpoRgNnx/renderscale-neoforge-1.21.11-1.3.6.jar' \
+   && curl -fsSL --max-time 120 -o /opt/cloudpc/mods/cloth-config-21.11.153-neoforge.jar \
+        'https://cdn.modrinth.com/data/9s6osm5g/versions/Wsus0EWg/cloth-config-21.11.153-neoforge.jar' \
+   && printf '%s  %s\n' \
+        '2f2f9f7dbc90f36fa9258755d2d01bbbcfdacbf70b50396ef7f5078b8bdf059aa06159bbcdf7a175a7c35463b07bbb46dfb7be06ecf975c0cbeb569846e5f2ff' /opt/cloudpc/mods/renderscale-neoforge-1.21.11-1.3.6.jar \
+        '04713c7d5c3e0a8de711b4f54933c2adf72836008e37dd6e65e8c10b4c7a45d28f3ecdf4b3a94dad6c62725cd5135247cafc378ae2711b13440962abf9c61dfe' /opt/cloudpc/mods/cloth-config-21.11.153-neoforge.jar \
+      | sha512sum -c - ) \
+  || echo 'CloudPC: could not fetch the pinned rendering mods; the instance starts without them'
+
 # Pin the seeded Prism instance to the current Minecraft release when the build
 # has network access; the baked version is kept when Mojang cannot be reached.
 RUN version="$(curl -fsS --max-time 25 https://launchermeta.mojang.com/mc/game/version_manifest_v2.json \

@@ -104,6 +104,93 @@ set_instance_default MinMemAlloc 512 1024
 set_instance_default MaxMemAlloc 1536 2560
 set_instance_default MinecraftWinWidth 960 800
 set_instance_default MinecraftWinHeight 540 450
+
+# Same idea for options.txt: terrain shading dominates the frame cost, so the
+# seeded view and simulation radius stay small. Both are in-game sliders.
+set_options_default() {
+  local key="$1" from="$2" to="$3"
+  [[ -f "$INSTANCE_OPTIONS" ]] || return 0
+  if grep -qx "${key}:${from}" "$INSTANCE_OPTIONS"; then
+    sed -i "s/^${key}:${from}\$/${key}:${to}/" "$INSTANCE_OPTIONS"
+    echo "CloudPC: option default ${key} ${from} -> ${to}"
+  fi
+}
+set_options_default renderDistance 4 3
+set_options_default simulationDistance 5 4
+
+# Every pixel of the Minecraft window is shaded on the CPU, so the seeded instance
+# draws the world at half resolution and upscales it: a quarter of the pixels for
+# the terrain, with the HUD still drawn at full size. RENDERSCALE=0 leaves the
+# instance's mods untouched for a clean unmodded test.
+INSTANCE_MODS="$INSTANCE_DIR/.minecraft/mods"
+RENDERSCALE_CONFIG="$INSTANCE_DIR/.minecraft/config/renderscale.json"
+
+# RenderScale 1.3.6 is a NeoForge 1.21.11 build. Loading it into anything else is a
+# mod-loading failure that stops Minecraft from starting, so check first.
+renderscale_compatible() {
+  python3 - "$1/mmc-pack.json" <<'PY'
+import json, sys
+try:
+    components = json.load(open(sys.argv[1])).get("components", [])
+except (OSError, ValueError):
+    sys.exit(1)
+minecraft = [c.get("version", "") for c in components if c.get("uid") == "net.minecraft"]
+neoforge = next((c.get("version", "") for c in components
+                 if c.get("uid") in ("net.neoforged", "net.neoforged.neoforge")), "")
+if minecraft[:1] != ["1.21.11"] or not neoforge:
+    sys.exit(1)
+try:
+    parts = [int(p) for p in neoforge.split("-")[0].split(".")[:3]]
+except ValueError:
+    sys.exit(1)
+sys.exit(0 if parts >= [21, 11, 6] else 1)
+PY
+}
+
+mod_present() {
+  [[ -d "$1" ]] || return 1
+  find "$1" -maxdepth 1 -iname "$2*.jar" -print -quit | grep -q .
+}
+
+install_renderscale() {
+  local instance="$1" mods="$1/.minecraft/mods" config="$1/.minecraft/config/renderscale.json" jar base name
+  name="$(basename "$instance")"
+  mkdir -p "$mods" "$(dirname "$config")"
+  for jar in /opt/cloudpc/mods/*.jar; do
+    [[ -e "$jar" ]] || continue
+    base="$(basename "$jar")"
+    # NeoForge refuses to start with two jars of one mod id, so never add a
+    # second build of something the instance already has.
+    if mod_present "$mods" "${base%%-[0-9]*}"; then
+      echo "CloudPC: ${name} already has a ${base%%-[0-9]*} jar, leaving it alone."
+      continue
+    fi
+    cp "$jar" "$mods/$base"
+    echo "CloudPC: added $base to ${name}"
+  done
+  if [[ ! -e "$config" ]]; then
+    printf '{\n  "scale": 0.5,\n  "forceLinear": false,\n  "irisScale": -1.0\n}\n' > "$config"
+    echo "CloudPC: RenderScale preset to 0.5 for ${name}"
+  fi
+}
+
+if [[ "${RENDERSCALE:-1}" = "0" ]]; then
+  echo "CloudPC: RENDERSCALE=0, not adding the rendering mods."
+elif [[ ! -d /opt/cloudpc/mods ]]; then
+  echo "CloudPC: the image has no pinned rendering mods, leaving the instances untouched."
+else
+  # Any instance that can load the builds gets them, not just the seeded one.
+  for instance in "$PRISM_DIR"/instances/*/; do
+    instance="${instance%/}"
+    [[ -f "$instance/mmc-pack.json" ]] || continue
+    if renderscale_compatible "$instance"; then
+      install_renderscale "$instance"
+    else
+      echo "CloudPC: $(basename "$instance") is not NeoForge 1.21.11, not adding RenderScale to it."
+    fi
+  done
+fi
+
 if [[ ! -f "/data/Desktop/Prism Launcher.desktop" ]]; then
   cp /opt/cloudpc/prism/PrismLauncher.desktop "/data/Desktop/Prism Launcher.desktop"
 fi
@@ -182,6 +269,18 @@ if [[ "$DISPLAY_READY" != "1" ]]; then
   echo "ERROR: Xvfb did not become ready."
   ps aux | grep '[X]vfb' || true
   exit 1
+fi
+
+# One line in the log that says what actually draws the desktop: a render node
+# means hardware OpenGL, otherwise Mesa falls back to llvmpipe on the CPU.
+if [[ -e /dev/dri/renderD128 || -e /dev/dri/card0 ]]; then
+  echo "CloudPC: /dev/dri is present, Mesa may use hardware OpenGL."
+else
+  echo "CloudPC: no /dev/dri, OpenGL runs on llvmpipe (${LP_NUM_THREADS} thread(s))."
+fi
+GL_RENDERER_LINE="$(timeout 15 env DISPLAY=:0 glxinfo -B 2>/dev/null | grep -m1 'OpenGL renderer' || true)"
+if [[ -n "$GL_RENDERER_LINE" ]]; then
+  echo "CloudPC: ${GL_RENDERER_LINE#*: }"
 fi
 
 # Session bus on loopback TCP: on a unix socket GDBus always sends

@@ -90,15 +90,20 @@ What CloudPC already does for you:
 - `LP_NUM_THREADS` is derived from the container's CPU quota, so llvmpipe uses the cores the app is actually allowed instead of spawning a worker per host core and thrashing.
 - The Mesa shader cache lives in `/data/.cache/mesa`, so shaders compiled by the LLVM JIT survive restarts.
 - The seeded instance opens in an 800×450 window (`instance.cfg`), a third of the pixels of the 1280×800 desktop, with a 2.5 GiB heap because 1.21.x plus mods thrashes a 1.5 GiB heap.
-- A fresh instance starts at render distance 4, simulation distance 5, fast graphics, smooth lighting off, no clouds, no entity shadows, minimal particles and vsync off.
+- A fresh instance starts at render distance 3, simulation distance 4, fast graphics, smooth lighting off, no clouds, no entity shadows, minimal particles and vsync off.
+- The image ships **RenderScale** 1.3.6 with the Cloth Config it needs, preset to `scale: 0.5`: the world is drawn at half the window resolution and upscaled, so terrain costs a quarter of the pixels while the HUD stays sharp. The jars are only added to instances that are NeoForge 1.21.11 with NeoForge 21.11.6 or newer (the builds are pinned to that version, and a mismatched loader mod stops Minecraft from starting), and never when the instance already has its own build of the same mod. Change the factor in game under **Mods → RenderScale → Config → Scale factor** (0.4 or 0.33 goes further), or delete both jars from `<instance>/.minecraft/mods`. Set `RENDERSCALE=0` in the app environment to stop CloudPC adding them at all.
 - Minecraft is forced out of fullscreen on start. The browser already scales the desktop to the device, and fullscreen is the most expensive case for a CPU rasteriser.
+
+How the numbers behave: at `scale 0.5` the terrain shader has a quarter of the pixels to shade, which typically turns 5 fps into 12–18 fps. Nothing reaches 30 fps on one core, because independent of pixel count the CPU also has to build chunk meshes, tick the world, run the JVM's GC and encode the VNC stream, and those do not shrink with resolution.
 
 If it is still slow:
 
 1. **Give the app more CPU.** This is the change that scales. 125% is about one core; 300–400% usually makes Minecraft playable, if your team pool has that spare.
-2. In game, **Esc → Options → Video**: keep render distance at 4–6 and simulation distance at 5.
-3. Keep the game window small; a bigger window means more pixels for the CPU to shade.
-4. Close other desktop programs while playing.
+2. In game, **Mods → RenderScale → Config**: drop the scale factor to 0.4 or 0.33. Each step is another large cut in shaded pixels, at the cost of a softer picture.
+3. **Esc → Options → Video**: render distance 2–3 and simulation distance 4 is the floor; every extra chunk ring is new geometry to build and draw.
+4. Keep the game window small; a bigger window means more pixels for the CPU to shade.
+5. Close other desktop programs while playing.
+6. Check the container log at boot: it prints the GL renderer once the display is up. `llvmpipe` there means no GPU is visible to the container and the CPU is doing all the drawing; `virgl`, `zink` or a real GPU name means the app does have hardware acceleration and the numbers should be much better.
 
 About the mods: **Sodium** targets OpenGL 4.5 hardware and replaces Mojang's terrain renderer with GPU-driven drawing, so on a software rasteriser it can be slightly faster or slower than vanilla depending on the scene. If numbers look wrong, try one session with Sodium removed. **FerriteCore** only saves memory and does not change frame rate. Run `glxinfo -B` in a desktop terminal to confirm: when it reports `llvmpipe (LLVM ...)`, the renderer is the CPU.
 
