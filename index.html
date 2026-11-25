@@ -1129,17 +1129,28 @@ function paintUpscaleButton() {
       : "GPU upscale off: the browser's own scaling draws the stream (tap to turn on)";
 }
 
+/* Contain-fit the framebuffer against the stage, computed here rather than copied
+ * from noVNC's canvas rect. Mirroring that rect looked equivalent and is not: any
+ * disagreement between where noVNC thinks its canvas is and where the stream
+ * actually is turns into a crop of the desktop instead of the whole picture. This
+ * way the device always sees all of the framebuffer, centred, with black bars —
+ * object-fit: contain, done in the shader's viewport. */
 function sizeGpuCanvas() {
   const element = gpu.canvas;
   if (!element || !canvas) return;
-  const box = canvas.getBoundingClientRect();
-  if (!box.width || !box.height) return;
+  const sourceWidth = canvas.width;
+  const sourceHeight = canvas.height;
+  if (!sourceWidth || !sourceHeight) return;
   const host = screenEl.getBoundingClientRect();
+  if (!host.width || !host.height) return;
+  const fit = Math.min(host.width / sourceWidth, host.height / sourceHeight);
+  const boxWidth = Math.max(1, Math.round(sourceWidth * fit));
+  const boxHeight = Math.max(1, Math.round(sourceHeight * fit));
   const style = element.style;
-  const left = Math.round(box.left - host.left) + "px";
-  const top = Math.round(box.top - host.top) + "px";
-  const width = Math.round(box.width) + "px";
-  const height = Math.round(box.height) + "px";
+  const left = Math.round((host.width - boxWidth) / 2) + "px";
+  const top = Math.round((host.height - boxHeight) / 2) + "px";
+  const width = boxWidth + "px";
+  const height = boxHeight + "px";
   if (style.left !== left) style.left = left;
   if (style.top !== top) style.top = top;
   if (style.width !== width) style.width = width;
@@ -1147,8 +1158,8 @@ function sizeGpuCanvas() {
   /* Render at device pixels, capped so a huge tablet canvas cannot ask for a
    * texture the adapter will refuse. */
   const scale = Math.min(window.devicePixelRatio || 1, 3);
-  const deviceWidth = Math.max(1, Math.min(Math.round(box.width * scale), 4096));
-  const deviceHeight = Math.max(1, Math.min(Math.round(box.height * scale), 4096));
+  const deviceWidth = Math.max(1, Math.min(Math.round(boxWidth * scale), 4096));
+  const deviceHeight = Math.max(1, Math.min(Math.round(boxHeight * scale), 4096));
   if (element.width !== deviceWidth) element.width = deviceWidth;
   if (element.height !== deviceHeight) element.height = deviceHeight;
 }

@@ -480,6 +480,34 @@ echo "CloudPC: session bus is listening (${DBUS_ADDRESS%%,guid=*})."
 # because the game resizes itself just after it opens, and never again afterwards,
 # so F11 stays yours. FIT_GAME_WINDOW=0 disables it.
 
+# Prism's own window is not a game window: fit_game_window below only watches for
+# Minecraft. On the shipped 800x500 desktop the launcher is about that size anyway,
+# but PIXEL_OFFLOAD shrinks the desktop underneath it, and a launcher bigger than
+# the framebuffer is shown cropped — the top-left of the window and no way to reach
+# the rest. So it is fitted once, and only when it is actually too big, which leaves
+# a launcher window the user sized themselves alone.
+fit_launcher_window() {
+  local wid="" attempt width="" height=""
+  for attempt in $(seq 1 40); do
+    wid="$(DISPLAY=:0 xdotool search --onlyvisible --name 'Prism Launcher' 2>/dev/null | head -n1 || true)"
+    if [[ -n "$wid" ]]; then
+      break
+    fi
+    sleep 1
+  done
+  if [[ -z "$wid" ]]; then
+    return 0
+  fi
+  width="$(DISPLAY=:0 xdotool getwindowgeometry --shell "$wid" 2>/dev/null | sed -n 's/^WIDTH=//p' || true)"
+  height="$(DISPLAY=:0 xdotool getwindowgeometry --shell "$wid" 2>/dev/null | sed -n 's/^HEIGHT=//p' || true)"
+  if [[ "$width" =~ ^[0-9]+$ && "$height" =~ ^[0-9]+$ ]] \
+     && (( width > SCREEN_WIDTH || height > SCREEN_HEIGHT )); then
+    timeout 5 xdotool windowsize --sync "$wid" "$SCREEN_WIDTH" "$SCREEN_HEIGHT" >/dev/null 2>&1 || true
+    timeout 5 xdotool windowmove --sync "$wid" 0 0 >/dev/null 2>&1 || true
+    echo "CloudPC: launcher window ${wid} was ${width}x${height}, fitted to ${SCREEN_WIDTH}x${SCREEN_HEIGHT}."
+  fi
+}
+
 fit_game_window() {
   local wid="" last="" attempt geometry
   while kill -0 "$XVFB_PID" 2>/dev/null; do
@@ -577,6 +605,9 @@ if [[ "$SESSION" == "lite" ]] && command -v openbox >/dev/null 2>&1; then
     runuser -u cloud -- env "${SESSION_ENV[@]}" prismlauncher &
     PRISM_PID=$!
     echo "CloudPC: Prism Launcher started (session memory kept off the game's core)."
+    if command -v xdotool >/dev/null 2>&1; then
+      fit_launcher_window &
+    fi
   else
     echo "CloudPC: AUTOSTART_PRISM=0, right-click the background and pick Prism Launcher."
   fi
