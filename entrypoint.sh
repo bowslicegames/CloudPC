@@ -3,8 +3,8 @@ set -Eeuo pipefail
 
 : "${NOVNC_PORT:=8080}"
 : "${VNC_PORT:=5900}"
-: "${SCREEN_WIDTH:=1024}"
-: "${SCREEN_HEIGHT:=640}"
+: "${SCREEN_WIDTH:=800}"
+: "${SCREEN_HEIGHT:=500}"
 : "${SCREEN_DEPTH:=24}"
 : "${JAVA_MIN_RAM:=512M}"
 : "${JAVA_MAX_RAM:=1536M}"
@@ -105,7 +105,7 @@ fi
 # size is chosen in the launcher, and from then on these lines are left alone.
 INSTANCE_CFG="$INSTANCE_DIR/instance.cfg"
 if [[ -f "$INSTANCE_CFG" ]] && ! grep -q '^OverrideWindow=' "$INSTANCE_CFG"; then
-  printf 'OverrideWindow=true\nMinecraftWinWidth=960\nMinecraftWinHeight=540\n' >> "$INSTANCE_CFG"
+  printf 'OverrideWindow=true\nMinecraftWinWidth=800\nMinecraftWinHeight=500\n' >> "$INSTANCE_CFG"
 fi
 
 # Mouse look needs the game to be fullscreen. While you play, GLFW hides the cursor
@@ -139,11 +139,13 @@ set_instance_default() {
 # 1.21.x with mods needs more heap than 1.5 GiB.
 set_instance_default MinMemAlloc 512 1024
 set_instance_default MaxMemAlloc 1536 2560
-# The desktop shrank to 1024x640 so the game window can be bigger (960x540, most
-# of the screen) while the world is shaded at a lower RenderScale factor below.
-# The old 800x450 preset is moved forward; a size chosen in Prism is left alone.
-set_instance_default MinecraftWinWidth 800 960
-set_instance_default MinecraftWinHeight 450 540
+# The desktop is 800x500: every pixel is shaded on the CPU and then encoded for
+# the browser, which upscales the stream to the device. That is 61% of the pixels of
+# the old 1024x640 desktop, at the same 16:10 shape, so nothing has to be re-laid-out.
+# A windowed game is fitted to the same size; a size chosen in Prism is left alone.
+set_instance_default MinecraftWinWidth 960 800
+set_instance_default MinecraftWinHeight 540 500
+set_instance_default MinecraftWinHeight 450 500
 
 # Same idea for options.txt: terrain shading dominates the frame cost, so the
 # seeded view and simulation radius stay small. Both are in-game sliders.
@@ -212,10 +214,10 @@ install_mods() {
     printf '{\n  "scale": 0.33,\n  "forceLinear": false,\n  "irisScale": -1.0\n}\n' > "$config"
     echo "CloudPC: RenderScale preset to 0.33 for ${name}"
   fi
-  # The preset is 0.33 since the game went fullscreen at 1024x640: fullscreen shades
-  # more pixels than the old 800x450 window, so a third keeps the world at roughly
-  # 71,000 shaded pixels, below the 90,000 it started at. Only a config that is
-  # still exactly what CloudPC wrote is moved; any other value is a factor the user
+  # The preset is 0.33: the game is fullscreen at 800x500, so the world is shaded at
+  # roughly 264x165, about 43,000 pixels, well below the 90,000 the original
+  # 800x450 window cost at 0.5. Only a config that is still exactly what CloudPC
+  # wrote is moved; any other value is a factor the user
   # picked in Mods -> RenderScale -> Config and stays as it is.
   if [[ -f "$config" ]]; then
     python3 - "$config" <<'PY'
