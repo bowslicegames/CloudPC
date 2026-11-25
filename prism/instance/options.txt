@@ -5,7 +5,9 @@ ao:false
 renderClouds:false
 entityShadows:false
 particles:2
-maxFps:60
+maxFps:30
 enableVsync:false
+entityDistanceScaling:0.5
+biomeBlendRadius:0
 guiScale:2
 fullscreen:true

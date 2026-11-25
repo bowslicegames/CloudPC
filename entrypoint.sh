@@ -18,8 +18,12 @@ set -Eeuo pipefail
 : "${SESSION:=lite}"
 # How long x11vnc sleeps between framebuffer polls and how long it batches damage
 # before encoding. Saving CPU here costs a few milliseconds of stream latency.
-: "${VNC_WAIT:=8}"
-: "${VNC_DEFER:=12}"
+# 16 + 30 ms is about 20 updates a second, more than a phone shows over a mobile
+# link, and it lets one encode carry a whole batch instead of two encodes carrying
+# half of it each. The old 8/12 polled and encoded roughly twice as often for the
+# same picture, on the core Minecraft was drawing on.
+: "${VNC_WAIT:=16}"
+: "${VNC_DEFER:=30}"
 
 # glibc gives every thread its own malloc arena (8 x cores of 64 MB mappings). On
 # a one-core container with Java, Mesa and GTK all allocating, capping the arenas
@@ -147,6 +151,31 @@ set_instance_default MinecraftWinWidth 960 800
 set_instance_default MinecraftWinHeight 540 500
 set_instance_default MinecraftWinHeight 450 500
 
+# The JVM is the other process that has to fit in one and a half cores. Prism
+# leaves it on G1, whose concurrent marking, refinement threads and per-store
+# barrier are all extra work that has to be squeezed into the core the game is
+# drawing on. Below about two cores a stop-the-world Serial GC is faster: one
+# collection pass, no background threads, a pointer-bump allocator and no barrier.
+# The other two flags are container wins: stop writing the perf counters through a
+# memory-mapped file, and cap the JIT compilers at two so a host with dozens of
+# cores cannot fill this container with compiler threads.
+# Only Prism's "use the defaults" state is replaced. Once the value is written, or
+# the user changes it in Prism, it is left alone.
+CLOUDPC_JVM_ARGS='-XX:+UseSerialGC -XX:+PerfDisableSharedMem -XX:CICompilerCount=2'
+if [[ -f "$INSTANCE_CFG" ]] && ! grep -qx 'OverrideJavaArgs=true' "$INSTANCE_CFG"; then
+  if grep -qx 'OverrideJavaArgs=false' "$INSTANCE_CFG"; then
+    sed -i 's/^OverrideJavaArgs=false$/OverrideJavaArgs=true/' "$INSTANCE_CFG"
+  else
+    printf 'OverrideJavaArgs=true\n' >> "$INSTANCE_CFG"
+  fi
+  if grep -q '^JvmArgs=' "$INSTANCE_CFG"; then
+    sed -i "s|^JvmArgs=.*\$|JvmArgs=${CLOUDPC_JVM_ARGS}|" "$INSTANCE_CFG"
+  else
+    printf 'JvmArgs=%s\n' "$CLOUDPC_JVM_ARGS" >> "$INSTANCE_CFG"
+  fi
+  echo "CloudPC: Minecraft JVM set to Serial GC for a ${LP_NUM_THREADS}-thread container"
+fi
+
 # Same idea for options.txt: terrain shading dominates the frame cost, so the
 # seeded view and simulation radius stay small. Both are in-game sliders.
 set_options_default() {
@@ -159,6 +188,26 @@ set_options_default() {
 }
 set_options_default renderDistance 4 3
 set_options_default simulationDistance 5 4
+# The stream ships about 20 updates a second, so 30 fps is already more than the
+# picture can show. An uncapped menu, sky or paused game is the cheapest place to
+# hand a core back to the encoder and to everything else on the box.
+set_options_default maxFps 60 30
+
+# Options that only add per-frame work and that an older options.txt does not
+# contain at all. Each is written once and then belongs to the game: a key that is
+# already there, including a value chosen with the in-game sliders, is left alone.
+add_options_default() {
+  local key="$1" value="$2"
+  [[ -f "$INSTANCE_OPTIONS" ]] || return 0
+  if ! grep -q "^${key}:" "$INSTANCE_OPTIONS"; then
+    printf '%s:%s\n' "$key" "$value" >> "$INSTANCE_OPTIONS"
+    echo "CloudPC: option added ${key}:${value}"
+  fi
+}
+# Entities stop being drawn beyond half the normal range -- visible only when many
+# are in view at once -- and biome colours are blended per block unless this is 0.
+add_options_default entityDistanceScaling 0.5
+add_options_default biomeBlendRadius 0
 
 # Every pixel of the Minecraft window is shaded on the CPU, so the seeded instance
 # draws the world at half resolution and upscales it: a quarter of the pixels for
@@ -355,6 +404,17 @@ if [[ -n "$GL_RENDERER_LINE" ]]; then
   echo "CloudPC: ${GL_RENDERER_LINE#*: }"
 fi
 
+# One line with every number that decides how fast this session can be, so a slow
+# desktop can be diagnosed from the log instead of guessed at. nproc is what the
+# host reports, which is why llvmpipe needs the cgroup quota instead of it.
+CPU_BUDGET="$(cgroup_cpu_limit)"
+echo "CloudPC: performance -- ${CPU_BUDGET} CPU core(s) allowed (nproc $(nproc)), llvmpipe ${LP_NUM_THREADS} thread(s), stream ${VNC_WAIT}/${VNC_DEFER} ms, Minecraft on Serial GC."
+case "$GL_RENDERER_LINE" in
+  *softpipe*)
+    echo "WARNING: Mesa is on softpipe, which is several times slower than llvmpipe. Check that libgl1-mesa-dri is installed; GALLIUM_DRIVER=llvmpipe forces the fast rasteriser."
+    ;;
+esac
+
 # Session bus on loopback TCP: on a unix socket GDBus always sends
 # SCM_CREDENTIALS first, which sandboxed runtimes reject with EPERM. That is the
 # "Unable to contact settings server ... Operation not permitted" dialog: xfconfd
@@ -516,10 +576,12 @@ fi
 
 # Keep x11vnc output visible: startup failures must be diagnosable in Altare.
 #
-# The encoder runs one notch below Minecraft in CPU priority. The stream can be a
-# few milliseconds late without hurting anything, while the frame the game is
-# drawing cannot wait: on a ~1 CPU container renice is the cheapest way to give the
-# renderer the core when both want it.
+# The encoder runs well below Minecraft in CPU priority. The stream can be a few
+# milliseconds late without hurting anything, while the frame the game is drawing
+# cannot wait: on a ~1 CPU container renice is the cheapest way to give the
+# renderer the core when both want it. 12, not 5, because x11vnc now also encodes
+# in bigger batches: when the core is contended it should lose whole frames rather
+# than steal slices of every one the game is trying to draw.
 #
 # With -noxdamage x11vnc has no idea which rectangles changed: it re-reads the
 # whole framebuffer every poll, and on a ~1 CPU container that read is slow
@@ -535,7 +597,7 @@ if [[ "${VNC_NO_DAMAGE:-0}" == "1" ]]; then
 fi
 echo "CloudPC: starting password-protected VNC server..."
 runuser -u cloud -- env HOME=/home/cloud DISPLAY=:0 \
-  nice -n 5 x11vnc -display :0 -rfbauth "$VNC_PASSWD_FILE" -rfbport "${VNC_PORT}" \
+  nice -n 12 x11vnc -display :0 -rfbauth "$VNC_PASSWD_FILE" -rfbport "${VNC_PORT}" \
   -forever -shared -repeat -localhost -wait "$VNC_WAIT" -defer "$VNC_DEFER" \
   "${VNC_EXTRA_ARGS[@]}" &
 VNC_PID=$!
