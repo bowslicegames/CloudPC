@@ -118,6 +118,11 @@ class Pointer:
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     server_version = "CloudPC"
+    # Every response here is small and interactive — a look update's reply is about
+    # 60 bytes. Nagle would hold it waiting for an ACK, and the browser would hold
+    # the next look update waiting for that reply, so the delay compounds into
+    # hundreds of milliseconds of input lag that has nothing to do with the network.
+    disable_nagle_algorithm = True
 
     # The container log belongs to the desktop and the game, not to a request per
     # look update.
@@ -169,6 +174,15 @@ class Handler(BaseHTTPRequestHandler):
         except (OSError, ValueError):
             return self.reply(502, "text/plain", "websockify is not reachable")
         upstream.settimeout(None)
+
+        # The same reason as on the HTTP side, one hop further along: websockify
+        # carries RFB frames that can be a few dozen bytes, and every one of them is
+        # something the game is waiting to draw or the player is waiting to see.
+        for sock in (self.connection, upstream):
+            try:
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            except OSError:
+                pass
 
         head = "%s %s HTTP/1.1\r\n" % (self.command, self.path)
         for key, value in self.headers.items():

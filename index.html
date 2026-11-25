@@ -31,6 +31,7 @@ body{display:flex;flex-direction:column;-webkit-tap-highlight-color:transparent;
 }
 #toolbar strong{font-size:15px;letter-spacing:.02em}
 #status{flex:1 1 110px;min-width:0;color:#bdc9da;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+#fps{flex:0 0 auto;font:600 12px/1 ui-monospace,SFMono-Regular,Menlo,monospace;color:#93c5fd;opacity:.85}
 #toolbar .buttons{display:flex;gap:6px;margin-left:auto}
 button{
   min-width:48px;min-height:48px;padding:0 12px;border:0;border-radius:12px;background:#22304a;color:#e6eefc;
@@ -162,6 +163,7 @@ button[aria-pressed="true"],button.primary{background:var(--accent);color:var(--
 <header id="toolbar">
   <strong>CloudPC</strong>
   <span id="status">Connecting to desktop…</span>
+  <span id="fps" title="Stream updates per second: how many new frames actually reach this device">-- fps</span>
   <div class="buttons">
     <button id="keyboardBtn" type="button" title="On-screen keyboard" aria-label="On-screen keyboard">⌨</button>
     <button id="trackpadBtn" type="button" title="Trackpad (touch pointer)" aria-label="Trackpad" aria-pressed="false">🖱</button>
@@ -244,6 +246,7 @@ import RFB from "/core/rfb.js";
 
 const screenEl = document.querySelector("#screen");
 const statusEl = document.querySelector("#status");
+const fpsEl = document.querySelector("#fps");
 const reconnectBtn = document.querySelector("#reconnect");
 const keyboardBtn = document.querySelector("#keyboardBtn");
 const trackpadBtn = document.querySelector("#trackpadBtn");
@@ -740,6 +743,7 @@ const LOOK_INTERVAL = 50;
 const LOOK_URL = "/cloudpc/mouse";
 let look = null;
 let lookTimer = 0;
+let lookInFlight = false;
 let lookSentAt = 0;
 let lookOk = 0;
 let lookFail = 0;
@@ -764,12 +768,12 @@ function sendLook(dx, dy) {
   const stepY = Math.round(dy * gain);
   if (!stepX && !stepY) return;
   lookStep = { x: stepX, y: stepY };
+  lookInFlight = true;
   fetch(LOOK_URL, {
     method: "POST",
     headers: { "Content-Type": "application/json", "X-CloudPC": "1" },
     body: JSON.stringify({ dx: stepX, dy: stepY }),
     cache: "no-store",
-    keepalive: true,
   })
     .then(response => (response.ok ? response.json().catch(() => ({})) : null))
     .then(data => {
@@ -778,11 +782,21 @@ function sendLook(dx, dy) {
       if (Number.isFinite(data.x)) lookPointer = data.x + "," + data.y;
     })
     .catch(() => { lookFail += 1; })
-    .then(showLookDebug);
+    .finally(() => {
+      lookInFlight = false;
+      /* Whatever travel arrived while this request was out has been collecting in
+       * lookTravel. Send it as one bigger step rather than queueing a request
+       * behind this one: on a slow link a queue grows every second and the view
+       * ends up a second behind the finger. One request in flight bounds the lag
+       * at one round trip, and no motion is lost, because the deltas add up. */
+      if (lookTravel.x || lookTravel.y) queueLook();
+      showLookDebug();
+    });
 }
 
 function flushLook() {
   if (lookTimer) { clearTimeout(lookTimer); lookTimer = 0; }
+  if (lookInFlight) return;
   const dx = lookTravel.x;
   const dy = lookTravel.y;
   if (!dx && !dy) return;
@@ -793,7 +807,7 @@ function flushLook() {
 }
 
 function queueLook() {
-  if (lookTimer) return;
+  if (lookTimer || lookInFlight) return;
   const wait = LOOK_INTERVAL - (performance.now() - lookSentAt);
   if (wait <= 0) {
     flushLook();
@@ -991,11 +1005,70 @@ function applyStreamMode(connection) {
   if (!connection) return;
   try {
     connection.compressionLevel = setting.compression;
-    connection.qualityLevel = setting.quality;
+    connection.qualityLevel = qualityFor(setting);
   } catch {
     /* an older noVNC without these properties simply keeps its defaults */
   }
 }
+
+/* A smaller framebuffer is upscaled further on the device, so the same JPEG
+ * artifacts are magnified more than they are at full size — and grain is the one
+ * thing the GPU stage cannot fix, because what it does is sharpen. The encoder is
+ * also working on fewer pixels, so the same preset can afford a higher quality
+ * there. 800x500 keeps the preset exactly as it is. */
+function qualityFor(setting) {
+  const pixels = canvas ? canvas.width * canvas.height : 0;
+  if (!pixels) return setting.quality;
+  if (pixels <= 200000) return Math.min(9, setting.quality + 3);
+  if (pixels <= 320000) return Math.min(9, setting.quality + 2);
+  return setting.quality;
+}
+
+/* The canvas has no size until the first framebuffer update arrives, so the quality
+ * above can only be worked out once the stream is actually running. */
+function reapplyStreamModeWhenSized(connection) {
+  let tries = 0;
+  const tick = () => {
+    if (rfb !== connection) return;
+    if (canvas && canvas.width && canvas.height) { applyStreamMode(connection); return; }
+    if (tries++ < 240) requestAnimationFrame(tick);
+  };
+  tick();
+}
+
+/* Count frames as they are drawn. noVNC paints each update into the canvas with
+ * drawImage (JPEG rectangles) or putImageData (raw ones), and it holds the context
+ * object itself, so wrapping those two methods counts updates without touching
+ * noVNC. It is the stream's rate, which is the number that decides how smooth the
+ * picture feels — the game's own frame rate is only visible in F3. */
+let frameCount = 0;
+let fpsValue = 0;
+let fpsLast = 0;
+
+function hookFrameCounter(element) {
+  if (!element || element.dataset.fpsHooked === "1") return;
+  const context = element.getContext("2d");
+  if (!context) return;
+  element.dataset.fpsHooked = "1";
+  for (const name of ["drawImage", "putImageData"]) {
+    const original = context[name];
+    if (typeof original !== "function") continue;
+    context[name] = function (...args) {
+      frameCount += 1;
+      return original.apply(this, args);
+    };
+  }
+}
+
+setInterval(() => {
+  const now = performance.now();
+  const seconds = fpsLast ? (now - fpsLast) / 1000 : 1;
+  fpsLast = now;
+  const rate = frameCount / Math.max(seconds, 0.25);
+  frameCount = 0;
+  fpsValue = fpsValue ? fpsValue * 0.5 + rate * 0.5 : rate;
+  if (fpsEl) fpsEl.textContent = Math.round(fpsValue) + " fps";
+}, 1000);
 
 applyStreamMode(null);
 streamBtn.addEventListener("click", () => {
@@ -1357,6 +1430,8 @@ function adoptCanvas(connection) {
   element.addEventListener("mousemove", event => {
     cursor = { x: event.clientX, y: event.clientY };
   }, true);
+  hookFrameCounter(element);
+  reapplyStreamModeWhenSized(connection);
   ensureGpuStage();
 }
 
