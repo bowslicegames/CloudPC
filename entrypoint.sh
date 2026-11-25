@@ -487,7 +487,7 @@ echo "CloudPC: session bus is listening (${DBUS_ADDRESS%%,guid=*})."
 # the rest. So it is fitted once, and only when it is actually too big, which leaves
 # a launcher window the user sized themselves alone.
 fit_launcher_window() {
-  local wid="" attempt width="" height=""
+  local wid="" attempt width="" height="" tries=0
   for attempt in $(seq 1 40); do
     wid="$(DISPLAY=:0 xdotool search --onlyvisible --name 'Prism Launcher' 2>/dev/null | head -n1 || true)"
     if [[ -n "$wid" ]]; then
@@ -496,16 +496,36 @@ fit_launcher_window() {
     sleep 1
   done
   if [[ -z "$wid" ]]; then
+    echo "CloudPC: no Prism Launcher window appeared to fit to ${SCREEN_WIDTH}x${SCREEN_HEIGHT}."
     return 0
   fi
-  width="$(DISPLAY=:0 xdotool getwindowgeometry --shell "$wid" 2>/dev/null | sed -n 's/^WIDTH=//p' || true)"
-  height="$(DISPLAY=:0 xdotool getwindowgeometry --shell "$wid" 2>/dev/null | sed -n 's/^HEIGHT=//p' || true)"
-  if [[ "$width" =~ ^[0-9]+$ && "$height" =~ ^[0-9]+$ ]] \
-     && (( width > SCREEN_WIDTH || height > SCREEN_HEIGHT )); then
+  # Prism restores its own saved geometry a second or so after the window maps,
+  # which undoes a single resize and leaves a window bigger than the framebuffer.
+  # So this keeps checking for a while and fits again while it is still too big,
+  # and says what happened when it stops — either the window settled, or it has a
+  # minimum size that no resize can cross.
+  for attempt in $(seq 1 20); do
+    width="$(DISPLAY=:0 xdotool getwindowgeometry --shell "$wid" 2>/dev/null | sed -n 's/^WIDTH=//p' || true)"
+    height="$(DISPLAY=:0 xdotool getwindowgeometry --shell "$wid" 2>/dev/null | sed -n 's/^HEIGHT=//p' || true)"
+    if [[ ! "$width" =~ ^[0-9]+$ || ! "$height" =~ ^[0-9]+$ ]]; then
+      sleep 1
+      continue
+    fi
+    if (( width <= SCREEN_WIDTH && height <= SCREEN_HEIGHT )); then
+      if (( tries > 0 )); then
+        echo "CloudPC: launcher window settled at ${width}x${height}."
+      fi
+      return 0
+    fi
+    if (( tries == 0 )); then
+      echo "CloudPC: launcher window ${wid} is ${width}x${height}, fitting to ${SCREEN_WIDTH}x${SCREEN_HEIGHT}."
+    fi
     timeout 5 xdotool windowsize --sync "$wid" "$SCREEN_WIDTH" "$SCREEN_HEIGHT" >/dev/null 2>&1 || true
     timeout 5 xdotool windowmove --sync "$wid" 0 0 >/dev/null 2>&1 || true
-    echo "CloudPC: launcher window ${wid} was ${width}x${height}, fitted to ${SCREEN_WIDTH}x${SCREEN_HEIGHT}."
-  fi
+    tries=$((tries + 1))
+    sleep 1
+  done
+  echo "WARNING: launcher window ${wid} will not go below ${width}x${height} on a ${SCREEN_WIDTH}x${SCREEN_HEIGHT} desktop — that is its minimum size. Use PIXEL_OFFLOAD=1 (640x400), or unset PIXEL_OFFLOAD."
 }
 
 fit_game_window() {
