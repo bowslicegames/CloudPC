@@ -1076,14 +1076,54 @@ fn fs(frag: VSOut) -> @location(0) vec4f {
 }
 `;
 
+/* Three different things can leave this stage unavailable and only one of them is
+ * the browser's fault, so the reason is worked out rather than assumed:
+ *
+ *   insecure  the page is not a secure context. WebGPU is only exposed over HTTPS
+ *             (or localhost), so on http:// navigator.gpu does not exist at all, in
+ *             every browser, however new it is. This is the common one: an app served
+ *             on a bare port is plain HTTP.
+ *   browser   a secure page, but no WebGPU: an iPad below iPadOS 26, or Chrome on
+ *             iPadOS, which is a WebKit shell that is not given WebGPU.
+ *   ok        navigator.gpu exists; a failure from here on is the device or the
+ *             shader, and the stage falls back on its own.
+ */
+function gpuUnavailableReason() {
+  if (typeof navigator !== "undefined" && navigator.gpu) return "ok";
+  if (typeof window !== "undefined" && window.isSecureContext === false) return "insecure";
+  return "browser";
+}
+
+function gpuUnavailableText(reason) {
+  if (reason === "insecure") {
+    return "GPU upscale needs HTTPS: this page is " + location.protocol +
+      "//, and browsers hide WebGPU on insecure origins. Open CloudPC over https://.";
+  }
+  return "This browser has no WebGPU. On an iPad that means Safari on iPadOS 26 or newer.";
+}
+
+let explainTimer = 0;
+function explainGpuUnavailable(reason) {
+  const message = gpuUnavailableText(reason);
+  const previous = statusEl.textContent;
+  statusEl.textContent = message;
+  console.warn("CloudPC: " + message);
+  clearTimeout(explainTimer);
+  explainTimer = setTimeout(() => {
+    if (statusEl.textContent === message) statusEl.textContent = previous;
+  }, 9000);
+}
+
 function paintUpscaleButton() {
   if (!upscaleBtn) return;
-  const supported = !!(typeof navigator !== "undefined" && navigator.gpu);
-  upscaleBtn.disabled = !supported;
+  const reason = gpuUnavailableReason();
+  const supported = reason === "ok";
+  /* Never disabled: tapping it is how the reason is shown, because a phone has no
+   * tooltip to read a title from. */
   upscaleBtn.setAttribute("aria-pressed", String(supported && gpu.wanted && gpu.ready));
   upscaleBtn.textContent = !supported ? "GPU ✕" : gpu.ready ? "GPU" : "GPU off";
   upscaleBtn.title = !supported
-    ? "This browser has no WebGPU, so the device cannot take the upscale"
+    ? gpuUnavailableText(reason)
     : gpu.ready
       ? "GPU upscale on: the device scales and sharpens the stream (tap to turn off)"
       : "GPU upscale off: the browser's own scaling draws the stream (tap to turn on)";
@@ -1220,7 +1260,10 @@ async function startGpuStage() {
     context.configure({ device, format, alphaMode: "opaque" });
 
     const module = device.createShaderModule({ code: GPU_WGSL });
-    const pipeline = device.createRenderPipeline({
+    /* Async on purpose: a WGSL or pipeline error rejects here, inside the try, so
+     * the stage falls back to the browser's scaling. createRenderPipeline() would
+     * only raise an uncaptured device error and leave a black canvas behind. */
+    const pipeline = await device.createRenderPipelineAsync({
       layout: "auto",
       vertex: { module, entryPoint: "vs" },
       fragment: { module, entryPoint: "fs", targets: [{ format }] },
@@ -1275,7 +1318,8 @@ function ensureGpuStage() {
 }
 
 upscaleBtn.addEventListener("click", () => {
-  if (!navigator.gpu) return;
+  const reason = gpuUnavailableReason();
+  if (reason !== "ok") { explainGpuUnavailable(reason); return; }
   const turningOff = gpu.wanted && gpu.ready && !gpu.failed;
   gpu.wanted = !turningOff;
   try { localStorage.setItem(UPSCALE_KEY, gpu.wanted ? "1" : "0"); } catch { /* ignore */ }
@@ -1289,6 +1333,9 @@ upscaleBtn.addEventListener("click", () => {
 });
 
 paintUpscaleButton();
+if (gpuUnavailableReason() !== "ok") {
+  console.warn("CloudPC: " + gpuUnavailableText(gpuUnavailableReason()));
+}
 
 /* ---------- connection ---------- */
 function adoptCanvas(connection) {
