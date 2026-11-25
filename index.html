@@ -644,6 +644,12 @@ function remotePixelsPerCssPixel() {
  * now "middle of the screen plus this interval's travel", so every direction
  * always has a full half screen of room and can never run out.
  *
+ * That middle must be the very point Minecraft pins the hidden cursor to, which is
+ * the middle of its window, so the game runs fullscreen on this desktop: both
+ * middles are then the same pixel. A windowed game sits wherever the window manager
+ * put it, the gap between the two is added to every update, and the camera slides
+ * that one way no matter which way the finger goes.
+ *
  * Minecraft reads the mouse 20 times a second no matter what the frame rate is,
  * so movement is collected and sent at that rate: the same turning speed at 5 or
  * 60 fps, one input event per tick instead of dozens for the server to process,

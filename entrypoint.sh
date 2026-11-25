@@ -81,12 +81,23 @@ if [[ -f "$INSTANCE_CFG" ]] && ! grep -q '^OverrideWindow=' "$INSTANCE_CFG"; the
   printf 'OverrideWindow=true\nMinecraftWinWidth=960\nMinecraftWinHeight=540\n' >> "$INSTANCE_CFG"
 fi
 
-# Full screen on a software-rendered display costs the most fill rate of all, and
-# the browser already scales the desktop to the device, so keep the game windowed.
-# Only this one in-game setting is touched; everything else is the user's.
+# Mouse look needs the game to be fullscreen. While you play, GLFW hides the cursor
+# and pins it to the centre of Minecraft's window, and the game reads the mouse as
+# the distance from that point. The look pad injects "centre of the screen plus
+# this interval's travel", which is only the same thing while the window is the
+# whole screen: a windowed game is off by the distance between the two centres,
+# and that fixed offset is added on every tick, so the camera slides one way no
+# matter which way the drag goes. Fullscreen makes both centres one pixel, so the
+# offset is zero by construction. Flipped once, with a marker, so turning
+# fullscreen off in game (F11) stays off.
 INSTANCE_OPTIONS="$INSTANCE_DIR/options.txt"
-if [[ -f "$INSTANCE_OPTIONS" ]]; then
-  sed -i 's/^fullscreen:true$/fullscreen:false/' "$INSTANCE_OPTIONS"
+FULLSCREEN_MARKER=/data/.local/share/.cloudpc-fullscreen
+if [[ -f "$INSTANCE_OPTIONS" && ! -e "$FULLSCREEN_MARKER" ]]; then
+  if grep -qx 'fullscreen:false' "$INSTANCE_OPTIONS"; then
+    sed -i 's/^fullscreen:false$/fullscreen:true/' "$INSTANCE_OPTIONS"
+    echo "CloudPC: Minecraft set to fullscreen so mouse look has a fixed centre"
+  fi
+  : > "$FULLSCREEN_MARKER"
 fi
 
 # Move earlier presets forward. Each key is only rewritten while it still holds
@@ -171,27 +182,34 @@ install_renderscale() {
     echo "CloudPC: added $base to ${name}"
   done
   if [[ ! -e "$config" ]]; then
-    printf '{\n  "scale": 0.4,\n  "forceLinear": false,\n  "irisScale": -1.0\n}\n' > "$config"
-    echo "CloudPC: RenderScale preset to 0.4 for ${name}"
+    printf '{\n  "scale": 0.33,\n  "forceLinear": false,\n  "irisScale": -1.0\n}\n' > "$config"
+    echo "CloudPC: RenderScale preset to 0.33 for ${name}"
   fi
-  # The preset is 0.4 since the game window grew from 800x450 to 960x540: the world
-  # is still shaded at roughly the old pixel count, just displayed bigger. Only a
-  # config that is still exactly what CloudPC wrote is moved; any other value is a
-  # factor the user picked in Mods -> RenderScale -> Config and stays as it is.
+  # The preset is 0.33 since the game went fullscreen at 1024x640: fullscreen shades
+  # more pixels than the old 800x450 window, so a third keeps the world at roughly
+  # 71,000 shaded pixels, below the 90,000 it started at. Only a config that is
+  # still exactly what CloudPC wrote is moved; any other value is a factor the user
+  # picked in Mods -> RenderScale -> Config and stays as it is.
   if [[ -f "$config" ]]; then
     python3 - "$config" <<'PY'
 import json, sys
 path = sys.argv[1]
-old = {"scale": 0.5, "forceLinear": False, "irisScale": -1.0}
 try:
     data = json.load(open(path))
 except (OSError, ValueError):
     raise SystemExit(0)
-if data == old:
-    old["scale"] = 0.4
+ours = (
+    isinstance(data, dict)
+    and set(data) == {"scale", "forceLinear", "irisScale"}
+    and data["forceLinear"] is False
+    and data["irisScale"] == -1.0
+    and data["scale"] in (0.5, 0.4)
+)
+if ours:
+    data["scale"] = 0.33
     with open(path, "w") as handle:
-        json.dump(old, handle, indent=2)
-    print("CloudPC: RenderScale preset moved from 0.5 to 0.4")
+        json.dump(data, handle, indent=2)
+    print("CloudPC: RenderScale preset moved to 0.33")
 PY
   fi
 }

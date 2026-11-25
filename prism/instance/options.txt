@@ -8,4 +8,4 @@ particles:2
 maxFps:60
 enableVsync:false
 guiScale:2
-fullscreen:false
+fullscreen:true
