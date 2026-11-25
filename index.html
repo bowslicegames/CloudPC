@@ -120,6 +120,17 @@ button[aria-pressed="true"],button.primary{background:var(--accent);color:var(--
 }
 #controls button[data-active="1"],#trackpad button[data-active="1"]{background:var(--accent);color:var(--accent-ink)}
 
+/* What the look path is actually sending: the point on the desktop, the travel that
+ * produced it, and the game window the container measured. Small, read-only, and
+ * only while the game overlay is on. */
+#lookDebug{
+  position:absolute;left:calc(8px + env(safe-area-inset-left));top:8px;z-index:27;
+  max-width:calc(100% - 16px);padding:4px 8px;border-radius:8px;
+  font:11px/1.4 ui-monospace,SFMono-Regular,Menlo,monospace;color:#cfe0ff;
+  background:rgba(8,13,22,.62);white-space:pre-wrap;pointer-events:none;
+}
+#lookDebug[hidden]{display:none}
+
 /* ---------- password prompt ---------- */
 #passwordPrompt{position:fixed;inset:0;z-index:40;display:grid;place-items:center;padding:20px;background:rgba(8,13,22,.84)}
 #passwordPrompt[hidden]{display:none}
@@ -192,6 +203,7 @@ button[aria-pressed="true"],button.primary{background:var(--accent);color:var(--
         <button type="button" data-key="Space">Jump</button>
       </div>
     </div>
+    <div id="lookDebug" hidden></div>
     <div id="hotbar" role="group" aria-label="Hotbar">
       <button type="button" data-key="Digit1">1</button>
       <button type="button" data-key="Digit2">2</button>
@@ -234,6 +246,7 @@ const streamBtn = document.querySelector("#streamBtn");
 const trackpadEl = document.querySelector("#trackpad");
 const controlsEl = document.querySelector("#controls");
 const lookSurface = document.querySelector("#lookside");
+const lookDebugEl = document.querySelector("#lookDebug");
 const vk = document.querySelector("#vk");
 const passwordPrompt = document.querySelector("#passwordPrompt");
 const passwordForm = document.querySelector("#passwordForm");
@@ -349,14 +362,80 @@ function ensureCursor() {
   return cursor;
 }
 
-/* The game overlay locks the pointer to the middle of the game window. In
- * fullscreen that is the middle of the screen, which is exactly where Minecraft
- * pins its hidden cursor while it plays, so a press arrives with no travel
- * attached and a click never drags the camera. */
-function lockPoint() {
+/* Where the game really is on the desktop.
+ *
+ * Every look update is "a point plus this interval's travel", and Minecraft reads
+ * the mouse as the offset from the centre of its own window. If that point is not
+ * the centre of that window, the difference is a constant, it is added to every
+ * single update, and the camera walks one way whichever way you swipe — a swipe the
+ * other way only subtracts a little from the walk. Rather than assume anything, the
+ * container measures the game window and writes it to cloudpc-game.json (see
+ * fit_game_window in entrypoint.sh) and this reads it back, so the point is the
+ * measured centre and the difference is zero by construction.
+ *
+ * The other way this ends up one-directional is noVNC's own coordinate handling: it
+ * clamps anything outside the canvas to the canvas's last pixel, and a clamped point
+ * has lost the sign of the drag. Every update is therefore clamped inside the game
+ * window here, in the browser, before it is sent. */
+let gameRect = null; /* framebuffer pixels */
+let gameRectFetchAt = -Infinity;
+
+function refreshGameRect() {
+  const now = performance.now();
+  if (now - gameRectFetchAt < 1500) return;
+  gameRectFetchAt = now;
+  fetch("cloudpc-game.json", { cache: "no-store" })
+    .then(response => (response.ok ? response.json() : null))
+    .then(data => {
+      if (!data) return;
+      if (data.none) { gameRect = null; return; }
+      const w = Number(data.w);
+      const h = Number(data.h);
+      if (Number.isFinite(w) && w > 0 && Number.isFinite(h) && h > 0) {
+        gameRect = { x: Number(data.x) || 0, y: Number(data.y) || 0, w, h };
+      }
+    })
+    .catch(() => { /* not served, so fall back to the whole screen */ });
+}
+
+function framebufferSize() {
   const rect = canvasRect();
-  if (!rect) return null;
-  cursor = { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
+  return {
+    w: canvas && canvas.width ? canvas.width : (rect ? rect.width : 0),
+    h: canvas && canvas.height ? canvas.height : (rect ? rect.height : 0),
+  };
+}
+
+function framebufferToClient(fx, fy) {
+  const rect = canvasRect();
+  const fb = framebufferSize();
+  if (!rect || !fb.w || !fb.h) return null;
+  return {
+    x: rect.left + (fx / fb.w) * rect.width,
+    y: rect.top + (fy / fb.h) * rect.height,
+  };
+}
+
+/* The rectangle the look updates may use: the game window when it is known, the
+ * whole screen otherwise. */
+function lookBox() {
+  if (gameRect) return gameRect;
+  const fb = framebufferSize();
+  return { x: 0, y: 0, w: fb.w, h: fb.h };
+}
+
+function lookCentre() {
+  const box = lookBox();
+  return framebufferToClient(box.x + box.w / 2, box.y + box.h / 2);
+}
+
+/* The game overlay locks the pointer to the middle of the game window, which is
+ * exactly where Minecraft pins its hidden cursor while it plays, so a press arrives
+ * with no travel attached and a click never drags the camera. */
+function lockPoint() {
+  const centre = lookCentre();
+  if (!centre) return null;
+  cursor = clampToCanvas(centre.x, centre.y);
   return cursor;
 }
 
@@ -626,6 +705,7 @@ function setMode(next) {
   if (mode === "trackpad") ensureCursor();
   if (mode !== "trackpad") trackReset();
   if (mode !== "game") gameReset();
+  lookDebugEl.hidden = mode !== "game";
   syncLock();
 }
 
@@ -633,6 +713,7 @@ function setMode(next) {
  * owns the pointer, and the pointer parked on the lock point the moment the
  * overlay comes up. */
 function syncLock() {
+  if (mode === "game") refreshGameRect();
   if (rfb) {
     try { rfb.showDotCursor = mode !== "game"; } catch { /* older noVNC */ }
   }
@@ -721,15 +802,32 @@ function flushLook() {
   lookSentAt = performance.now();
   const rect = canvasRect();
   if (!rect || !canvas) return;
+  refreshGameRect();
+  const centre = lookCentre();
+  const fb = framebufferSize();
+  if (!centre || !fb.w || !fb.h) return;
+  const box = lookBox();
+  const perFbX = rect.width / fb.w; /* CSS pixels per desktop pixel */
+  const perFbY = rect.height / fb.h;
   const gain = lookGain * remotePixelsPerCssPixel();
-  const limitX = Math.max(1, rect.width / 2 - 2);
-  const limitY = Math.max(1, rect.height / 2 - 2);
+  /* Stay a few desktop pixels inside the game window: a point outside it is clamped
+   * by noVNC to the window edge, and a clamped point no longer carries the direction
+   * of the drag. */
+  const limitX = Math.max(1, (box.w / 2 - 3) * perFbX);
+  const limitY = Math.max(1, (box.h / 2 - 3) * perFbY);
   const within = (value, limit) => Math.max(-limit, Math.min(limit, value));
-  const x = rect.left + rect.width / 2 + within(dx * gain, limitX);
-  const y = rect.top + rect.height / 2 + within(dy * gain, limitY);
+  const x = centre.x + within(dx * gain, limitX);
+  const y = centre.y + within(dy * gain, limitY);
   cancelMove();
   cursor = { x, y };
   dispatchMouse("mousemove", x, y, 0, 0);
+  if (!lookDebugEl.hidden) {
+    lookDebugEl.textContent =
+      "look " + Math.round((x - rect.left) / perFbX) + "," +
+      Math.round((y - rect.top) / perFbY) +
+      "  travel " + Math.round(dx) + "," + Math.round(dy) +
+      "\nwin " + box.x + "," + box.y + " " + box.w + "x" + box.h;
+  }
 }
 
 function queueLook() {

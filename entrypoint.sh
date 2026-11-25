@@ -399,13 +399,59 @@ echo "CloudPC: session bus is listening (${DBUS_ADDRESS%%,guid=*})."
 # dependable here: GLFW asks XRandR for a video mode, Xvfb offers few, and xfwm4 or
 # openbox can still decorate the result and shift the client area down by a titlebar.
 # The geometry is applied once per Minecraft window, retried a few times because the
-# game resizes itself just after it opens, and never re-applied afterwards, so F11
-# still works. FIT_GAME_WINDOW=0 disables it.
+# game resizes itself just after it opens, and never again afterwards, so F11 stays
+# yours.
+#
+# Whatever the window ends up being, its real rectangle is published to
+# /usr/share/novnc/cloudpc-game.json every two seconds for the browser to read: the
+# look pad injects "a point plus travel" and Minecraft reads the mouse as the offset
+# from its own window's centre, so the page uses this rectangle instead of assuming
+# where the game is. That also keeps the update inside the window, where noVNC will
+# not clamp it to a corner and throw the direction of the drag away.
+# It is applied once per window so F11 still works, and FIT_GAME_WINDOW=0 disables it.
+GAME_GEO_JSON=/usr/share/novnc/cloudpc-game.json
+
+write_game_geo() { # x y w h
+  local tmp="${GAME_GEO_JSON}.tmp"
+  printf '{"x":%s,"y":%s,"w":%s,"h":%s}\n' "$1" "$2" "$3" "$4" >"$tmp" 2>/dev/null || return 0
+  chmod 644 "$tmp" 2>/dev/null || true
+  mv -f "$tmp" "$GAME_GEO_JSON" 2>/dev/null || true
+}
+
+write_game_none() {
+  local tmp="${GAME_GEO_JSON}.tmp"
+  printf '{"none":true}\n' >"$tmp" 2>/dev/null && mv -f "$tmp" "$GAME_GEO_JSON" 2>/dev/null || true
+}
+
+# Sets G_X G_Y G_W G_H from the window, without eval-ing anything.
+read_game_geo() {
+  local key value
+  G_X=0 G_Y=0 G_W=0 G_H=0
+  while IFS='=' read -r key value; do
+    case "$key" in
+      X) G_X="$value" ;;
+      Y) G_Y="$value" ;;
+      WIDTH) G_W="$value" ;;
+      HEIGHT) G_H="$value" ;;
+    esac
+  done < <(timeout 5 xdotool getwindowgeometry --shell "$1" 2>/dev/null || true)
+  [[ "$G_W" =~ ^[0-9]+$ && "$G_H" =~ ^[0-9]+$ ]] && (( G_W > 0 && G_H > 0 ))
+}
+
 fit_game_window() {
   local wid="" last="" attempt geometry
   while kill -0 "$XVFB_PID" 2>/dev/null; do
     wid="$(DISPLAY=:0 xdotool search --onlyvisible --name '^Minecraft' 2>/dev/null | head -n1 || true)"
-    if [[ -n "$wid" && "$wid" != "$last" ]]; then
+    if [[ -z "$wid" ]]; then
+      if [[ -n "$last" ]]; then
+        echo "CloudPC: game window closed"
+        write_game_none
+        last=""
+      fi
+      sleep 2
+      continue
+    fi
+    if [[ "$wid" != "$last" ]]; then
       last="$wid"
       # _MOTIF_WM_HINTS: ask the window manager for no titlebar and no border, so the
       # client area really is the whole framebuffer and not the framebuffer minus a
@@ -421,6 +467,9 @@ fit_game_window() {
       done
       geometry="$(DISPLAY=:0 xdotool getwindowgeometry --shell "$wid" 2>/dev/null | tr '\n' ' ' || true)"
       echo "CloudPC: game window ${wid} fitted to ${SCREEN_WIDTH}x${SCREEN_HEIGHT} at 0,0 (${geometry:-geometry unknown})"
+    fi
+    if read_game_geo "$wid"; then
+      write_game_geo "$G_X" "$G_Y" "$G_W" "$G_H"
     fi
     sleep 2
   done
