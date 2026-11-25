@@ -42,6 +42,13 @@ button[aria-pressed="true"],button.primary{background:var(--accent);color:var(--
 #stage{position:relative;flex:1 1 auto;min-height:0;display:flex}
 #screen{position:relative;flex:1 1 auto;display:flex;align-items:center;justify-content:center;overflow:hidden;background:#000}
 #screen canvas{max-width:100%;max-height:100%;touch-action:none}
+/* The GPU stage covers noVNC's canvas and is purely visual: it takes no pointer
+ * events, so taps fall through to the canvas underneath and noVNC still sends
+ * them. It also has to escape the max-width/max-height rule above, because its
+ * size is set explicitly from the rect of the canvas it is covering. */
+#screen canvas.gpuStage{
+  position:absolute;pointer-events:none;max-width:none;max-height:none;background:#000;
+}
 
 /* ---------- trackpad overlay (whole desktop) ---------- */
 #trackpad{
@@ -161,6 +168,7 @@ button[aria-pressed="true"],button.primary{background:var(--accent);color:var(--
     <button id="controlsBtn" type="button" title="Game controls" aria-label="Game controls" aria-pressed="false">🎮</button>
     <button id="fullscreenBtn" type="button" title="Fullscreen" aria-label="Fullscreen">⛶</button>
     <button id="streamBtn" type="button" title="Stream quality">Fast</button>
+    <button id="upscaleBtn" type="button" title="GPU upscale (WebGPU)" aria-pressed="true">GPU off</button>
     <button id="reconnect" class="primary" type="button">Reconnect</button>
 
   </div>
@@ -242,6 +250,7 @@ const trackpadBtn = document.querySelector("#trackpadBtn");
 const controlsBtn = document.querySelector("#controlsBtn");
 const fullscreenBtn = document.querySelector("#fullscreenBtn");
 const streamBtn = document.querySelector("#streamBtn");
+const upscaleBtn = document.querySelector("#upscaleBtn");
 const trackpadEl = document.querySelector("#trackpad");
 const controlsEl = document.querySelector("#controls");
 const lookSurface = document.querySelector("#lookside");
@@ -995,15 +1004,302 @@ streamBtn.addEventListener("click", () => {
   applyStreamMode(rfb);
 });
 
+/* ---------- the GPU stage: the device draws the last part of the frame ----------
+ *
+ * The container renders the desktop and x11vnc ships that framebuffer. Everything
+ * after the pixels exist is scaling, and scaling is the one stage of this pipeline
+ * a phone or tablet does better than the container: it has a real GPU and a battery
+ * to spend, the container has a slice of a shared CPU. So the browser stops leaving
+ * the final stretch to the compositor's bilinear and runs it itself, in WebGPU:
+ * linear upscale to the device's own pixel grid, then a five-tap adaptive unsharp.
+ *
+ * The point is not only a sharper picture. It is that the picture can be made
+ * smaller without looking soft, and a smaller framebuffer is the only way anything
+ * on the pixel side gets cheaper for the container: 640x400 is 36% fewer pixels for
+ * llvmpipe to shade and for x11vnc to read and JPEG, 512x320 is 59% fewer. That is
+ * what PIXEL_OFFLOAD in entrypoint.sh selects, and this stage is the half that makes
+ * it usable.
+ *
+ * It does not move Minecraft's rendering. The game still draws every frame on the
+ * container's CPU through llvmpipe; this only takes over the last stage after those
+ * pixels arrive. All-or-nothing on purpose: without WebGPU, without an adapter, or
+ * after a lost device, the overlay is removed and the canvas underneath is shown
+ * exactly as before.
+ */
+const UPSCALE_KEY = "cloudpc.gpuUpscale";
+const gpu = {
+  wanted: true, ready: false, failed: false, starting: false, generation: 0,
+  canvas: null, context: null, device: null, pipeline: null, sampler: null,
+  source: null, sourceWidth: 0, sourceHeight: 0, bindGroup: null, uniform: null,
+  frame: 0, lastDraw: 0, strength: 0.42,
+};
+try { gpu.wanted = localStorage.getItem(UPSCALE_KEY) !== "0"; } catch { /* default on */ }
+
+const GPU_WGSL = `
+struct Params { texel: vec2f, strength: f32, pad: f32 };
+@group(0) @binding(0) var samp: sampler;
+@group(0) @binding(1) var tex: texture_2d<f32>;
+@group(0) @binding(2) var<uniform> params: Params;
+
+struct VSOut { @builtin(position) pos: vec4f, @location(0) uv: vec2f };
+
+@vertex
+fn vs(@builtin(vertex_index) i: u32) -> VSOut {
+  var corners = array<vec2f, 6>(
+    vec2f(-1.0,  1.0), vec2f( 1.0,  1.0), vec2f(-1.0, -1.0),
+    vec2f(-1.0, -1.0), vec2f( 1.0,  1.0), vec2f( 1.0, -1.0)
+  );
+  let p = corners[i];
+  var result: VSOut;
+  result.pos = vec4f(p, 0.0, 1.0);
+  result.uv = vec2f((p.x + 1.0) * 0.5, (1.0 - p.y) * 0.5);
+  return result;
+}
+
+@fragment
+fn fs(frag: VSOut) -> @location(0) vec4f {
+  let t = params.texel;
+  let c = textureSample(tex, samp, frag.uv).rgb;
+  let n = textureSample(tex, samp, frag.uv + vec2f(0.0, -t.y)).rgb;
+  let s = textureSample(tex, samp, frag.uv + vec2f(0.0,  t.y)).rgb;
+  let e = textureSample(tex, samp, frag.uv + vec2f( t.x, 0.0)).rgb;
+  let w = textureSample(tex, samp, frag.uv + vec2f(-t.x, 0.0)).rgb;
+  let mn = min(min(min(n, s), min(e, w)), c);
+  let mx = max(max(max(n, s), max(e, w)), c);
+  /* How much room this pixel has before it clips. Flat mid-tones get the whole
+   * kernel, an edge against black or white gets almost none, which is what stops
+   * the sharpening drawing a dark halo around bright text. */
+  let amp = sqrt(clamp(min(mn, vec3f(1.0) - mx) / max(mx, vec3f(0.0001)), vec3f(0.0), vec3f(1.0)));
+  let k = amp * (params.strength * 0.25);
+  let sharp = c * (vec3f(1.0) + vec3f(4.0) * k) - k * (n + s + e + w);
+  return vec4f(clamp(sharp, vec3f(0.0), vec3f(1.0)), 1.0);
+}
+`;
+
+function paintUpscaleButton() {
+  if (!upscaleBtn) return;
+  const supported = !!(typeof navigator !== "undefined" && navigator.gpu);
+  upscaleBtn.disabled = !supported;
+  upscaleBtn.setAttribute("aria-pressed", String(supported && gpu.wanted && gpu.ready));
+  upscaleBtn.textContent = !supported ? "GPU ✕" : gpu.ready ? "GPU" : "GPU off";
+  upscaleBtn.title = !supported
+    ? "This browser has no WebGPU, so the device cannot take the upscale"
+    : gpu.ready
+      ? "GPU upscale on: the device scales and sharpens the stream (tap to turn off)"
+      : "GPU upscale off: the browser's own scaling draws the stream (tap to turn on)";
+}
+
+function sizeGpuCanvas() {
+  const element = gpu.canvas;
+  if (!element || !canvas) return;
+  const box = canvas.getBoundingClientRect();
+  if (!box.width || !box.height) return;
+  const host = screenEl.getBoundingClientRect();
+  const style = element.style;
+  const left = Math.round(box.left - host.left) + "px";
+  const top = Math.round(box.top - host.top) + "px";
+  const width = Math.round(box.width) + "px";
+  const height = Math.round(box.height) + "px";
+  if (style.left !== left) style.left = left;
+  if (style.top !== top) style.top = top;
+  if (style.width !== width) style.width = width;
+  if (style.height !== height) style.height = height;
+  /* Render at device pixels, capped so a huge tablet canvas cannot ask for a
+   * texture the adapter will refuse. */
+  const scale = Math.min(window.devicePixelRatio || 1, 3);
+  const deviceWidth = Math.max(1, Math.min(Math.round(box.width * scale), 4096));
+  const deviceHeight = Math.max(1, Math.min(Math.round(box.height * scale), 4096));
+  if (element.width !== deviceWidth) element.width = deviceWidth;
+  if (element.height !== deviceHeight) element.height = deviceHeight;
+}
+
+function resizeGpuSource(width, height) {
+  if (gpu.source) { try { gpu.source.destroy(); } catch { /* already gone */ } }
+  gpu.sourceWidth = width;
+  gpu.sourceHeight = height;
+  gpu.source = gpu.device.createTexture({
+    size: [width, height],
+    format: "rgba8unorm",
+    usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST | GPUTextureUsage.RENDER_ATTACHMENT,
+  });
+  gpu.bindGroup = gpu.device.createBindGroup({
+    layout: gpu.pipeline.getBindGroupLayout(0),
+    entries: [
+      { binding: 0, resource: gpu.sampler },
+      { binding: 1, resource: gpu.source.createView() },
+      { binding: 2, resource: { buffer: gpu.uniform } },
+    ],
+  });
+  gpu.device.queue.writeBuffer(gpu.uniform, 0,
+    new Float32Array([1 / width, 1 / height, gpu.strength, 0]));
+}
+
+function drawGpuFrame() {
+  if (!gpu.ready || !canvas || !canvas.isConnected) return;
+  const width = canvas.width;
+  const height = canvas.height;
+  if (!width || !height) return;
+  try {
+    if (gpu.sourceWidth !== width || gpu.sourceHeight !== height) resizeGpuSource(width, height);
+    if (!gpu.bindGroup) return;
+    sizeGpuCanvas();
+    if (!gpu.canvas.width || !gpu.canvas.height) return;
+    gpu.device.queue.copyExternalImageToTexture({ source: canvas }, { texture: gpu.source }, { width, height });
+    const encoder = gpu.device.createCommandEncoder();
+    const pass = encoder.beginRenderPass({
+      colorAttachments: [{
+        view: gpu.context.getCurrentTexture().createView(),
+        clearValue: { r: 0, g: 0, b: 0, a: 1 },
+        loadOp: "clear", storeOp: "store",
+      }],
+    });
+    pass.setPipeline(gpu.pipeline);
+    pass.setBindGroup(0, gpu.bindGroup);
+    pass.draw(6);
+    pass.end();
+    gpu.device.queue.submit([encoder.finish()]);
+  } catch (error) {
+    console.warn("CloudPC: GPU stage stopped, falling back to browser scaling:", error && error.message ? error.message : error);
+    stopGpuStage();
+    gpu.failed = true;
+  }
+}
+
+function startGpuLoop() {
+  if (gpu.frame) return;
+  const step = now => {
+    gpu.frame = requestAnimationFrame(step);
+    if (!gpu.ready || document.hidden) return;
+    /* The stream arrives at about 20 updates a second; drawing 30 times a second
+     * keeps up with it without copying a canvas nobody changed at 120 Hz. */
+    if (now - gpu.lastDraw < 33) return;
+    gpu.lastDraw = now;
+    drawGpuFrame();
+  };
+  gpu.frame = requestAnimationFrame(step);
+}
+
+function stopGpuStage() {
+  gpu.generation += 1;
+  if (gpu.frame) { cancelAnimationFrame(gpu.frame); gpu.frame = 0; }
+  if (gpu.canvas && gpu.canvas.parentNode) gpu.canvas.parentNode.removeChild(gpu.canvas);
+  if (gpu.source) { try { gpu.source.destroy(); } catch { /* already gone */ } }
+  if (gpu.device) { try { gpu.device.destroy(); } catch { /* already gone */ } }
+  gpu.ready = false;
+  gpu.starting = false;
+  gpu.canvas = null;
+  gpu.context = null;
+  gpu.device = null;
+  gpu.pipeline = null;
+  gpu.sampler = null;
+  gpu.source = null;
+  gpu.bindGroup = null;
+  gpu.uniform = null;
+  gpu.sourceWidth = 0;
+  gpu.sourceHeight = 0;
+  paintUpscaleButton();
+}
+
+async function startGpuStage() {
+  if (!gpu.wanted || gpu.ready || gpu.starting || !navigator.gpu) { paintUpscaleButton(); return; }
+  gpu.starting = true;
+  const generation = gpu.generation;
+  try {
+    const adapter = await navigator.gpu.requestAdapter({ powerPreference: "low-power" });
+    if (generation !== gpu.generation || !gpu.wanted) return;
+    if (!adapter) throw new Error("no WebGPU adapter");
+    const device = await adapter.requestDevice();
+    if (generation !== gpu.generation || !gpu.wanted) { device.destroy(); return; }
+
+    const element = document.createElement("canvas");
+    element.className = "gpuStage";
+    element.setAttribute("aria-hidden", "true");
+    const context = element.getContext("webgpu");
+    if (!context) throw new Error("no webgpu context");
+    const format = navigator.gpu.getPreferredCanvasFormat();
+    context.configure({ device, format, alphaMode: "opaque" });
+
+    const module = device.createShaderModule({ code: GPU_WGSL });
+    const pipeline = device.createRenderPipeline({
+      layout: "auto",
+      vertex: { module, entryPoint: "vs" },
+      fragment: { module, entryPoint: "fs", targets: [{ format }] },
+      primitive: { topology: "triangle-list" },
+    });
+    const sampler = device.createSampler({
+      magFilter: "linear", minFilter: "linear",
+      addressModeU: "clamp-to-edge", addressModeV: "clamp-to-edge",
+    });
+    const uniform = device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+
+    gpu.device = device;
+    gpu.canvas = element;
+    gpu.context = context;
+    gpu.pipeline = pipeline;
+    gpu.sampler = sampler;
+    gpu.uniform = uniform;
+    gpu.source = null;
+    gpu.sourceWidth = 0;
+    gpu.sourceHeight = 0;
+    gpu.ready = true;
+    screenEl.appendChild(element);
+
+    device.lost.then(info => {
+      if (info.reason === "destroyed") return;
+      console.warn("CloudPC: WebGPU device lost, falling back to browser scaling:", info.message);
+      stopGpuStage();
+      gpu.failed = true;
+    });
+
+    startGpuLoop();
+  } catch (error) {
+    if (generation !== gpu.generation) return;
+    console.warn("CloudPC: GPU upscale unavailable, using browser scaling:", error && error.message ? error.message : error);
+    stopGpuStage();
+    gpu.failed = true;
+  } finally {
+    gpu.starting = false;
+    paintUpscaleButton();
+  }
+}
+
+/* The stage lives inside #screen, which connect() empties on every reconnect, so
+ * this is called whenever a canvas is adopted rather than only once. */
+function ensureGpuStage() {
+  if (!gpu.wanted) return;
+  if (gpu.ready) {
+    if (gpu.canvas && gpu.canvas.parentNode !== screenEl) screenEl.appendChild(gpu.canvas);
+    return;
+  }
+  startGpuStage();
+}
+
+upscaleBtn.addEventListener("click", () => {
+  if (!navigator.gpu) return;
+  const turningOff = gpu.wanted && gpu.ready && !gpu.failed;
+  gpu.wanted = !turningOff;
+  try { localStorage.setItem(UPSCALE_KEY, gpu.wanted ? "1" : "0"); } catch { /* ignore */ }
+  if (gpu.wanted) {
+    gpu.failed = false;
+    startGpuStage();
+  } else {
+    stopGpuStage();
+  }
+  paintUpscaleButton();
+});
+
+paintUpscaleButton();
+
 /* ---------- connection ---------- */
 function adoptCanvas(connection) {
-  const element = connection._canvas || screenEl.querySelector("canvas");
+  const element = connection._canvas || screenEl.querySelector("canvas:not(.gpuStage)");
   if (!element || element === canvas) return;
   canvas = element;
   /* keep the virtual cursor in sync when the canvas is used directly */
   element.addEventListener("mousemove", event => {
     cursor = { x: event.clientX, y: event.clientY };
   }, true);
+  ensureGpuStage();
 }
 
 function connect() {

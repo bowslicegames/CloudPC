@@ -10,6 +10,23 @@ set -Eeuo pipefail
 : "${SCREEN_WIDTH:=800}"
 : "${SCREEN_HEIGHT:=500}"
 : "${SCREEN_DEPTH:=24}"
+# The browser takes the last stage of the pipeline (the upscale and the sharpening,
+# in index.html's WebGPU pass), so the container no longer has to shade and encode
+# every pixel at desktop size to keep the picture acceptable. PIXEL_OFFLOAD=1 or 2
+# picks a smaller framebuffer — 36% and 59% fewer pixels for llvmpipe to shade and
+# for x11vnc to read and JPEG — but only while SCREEN_WIDTH/SCREEN_HEIGHT still hold
+# the shipped 800x500, so an explicit resolution always wins over the preset.
+case "${PIXEL_OFFLOAD:-0}" in
+  1) OFFLOAD_WIDTH=640 OFFLOAD_HEIGHT=400 ;;
+  2) OFFLOAD_WIDTH=512 OFFLOAD_HEIGHT=320 ;;
+  *) OFFLOAD_WIDTH="" OFFLOAD_HEIGHT="" ;;
+esac
+if [[ -n "$OFFLOAD_WIDTH" && "$SCREEN_WIDTH" = "800" && "$SCREEN_HEIGHT" = "500" ]]; then
+  SCREEN_WIDTH="$OFFLOAD_WIDTH"
+  SCREEN_HEIGHT="$OFFLOAD_HEIGHT"
+  echo "CloudPC: PIXEL_OFFLOAD=${PIXEL_OFFLOAD} -- desktop ${SCREEN_WIDTH}x${SCREEN_HEIGHT}, the device upscales it."
+fi
+unset OFFLOAD_WIDTH OFFLOAD_HEIGHT
 : "${JAVA_MIN_RAM:=512M}"
 : "${JAVA_MAX_RAM:=1536M}"
 # Desktop on top of X: `lite` is openbox plus the launcher (no panel, no wallpaper
@@ -408,7 +425,7 @@ fi
 # desktop can be diagnosed from the log instead of guessed at. nproc is what the
 # host reports, which is why llvmpipe needs the cgroup quota instead of it.
 CPU_BUDGET="$(cgroup_cpu_limit)"
-echo "CloudPC: performance -- ${CPU_BUDGET} CPU core(s) allowed (nproc $(nproc)), llvmpipe ${LP_NUM_THREADS} thread(s), stream ${VNC_WAIT}/${VNC_DEFER} ms, Minecraft on Serial GC."
+echo "CloudPC: performance -- ${CPU_BUDGET} CPU core(s) allowed (nproc $(nproc)), llvmpipe ${LP_NUM_THREADS} thread(s), framebuffer ${SCREEN_WIDTH}x${SCREEN_HEIGHT} (PIXEL_OFFLOAD=${PIXEL_OFFLOAD:-0}), stream ${VNC_WAIT}/${VNC_DEFER} ms, Minecraft on Serial GC."
 case "$GL_RENDERER_LINE" in
   *softpipe*)
     echo "WARNING: Mesa is on softpipe, which is several times slower than llvmpipe. Check that libgl1-mesa-dri is installed; GALLIUM_DRIVER=llvmpipe forces the fast rasteriser."

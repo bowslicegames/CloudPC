@@ -15,7 +15,7 @@ A browser-accessible, lightweight Debian desktop intended for an Altare Docker A
 - Prism Launcher from Debian trixie-backports, preinstalled with a ready-to-run Minecraft instance and a one-tap desktop shortcut
 - OpenJDK 21 runtime
 - Persistent launcher configuration, accounts, instances, worlds, downloads and desktop files under `/data`
-- An 800×500 desktop with larger fonts and a big cursor for small screens; the browser upscales the stream to the device. The framebuffer is deliberately small: it is what the CPU rasteriser fills and what x11vnc reads and encodes, so 800×500 is 61% of the pixels of a 1024×640 desktop at the same 16:10 shape. `SCREEN_WIDTH` / `SCREEN_HEIGHT` override it; 640×400 is a further 36% cut if you want more speed and do not mind a softer picture
+- An 800×500 desktop with larger fonts and a big cursor for small screens; the browser upscales the stream to the device. The framebuffer is deliberately small: it is what the CPU rasteriser fills and what x11vnc reads and encodes, so 800×500 is 61% of the pixels of a 1024×640 desktop at the same 16:10 shape. `SCREEN_WIDTH` / `SCREEN_HEIGHT` override it; 640×400 is a further 36% cut if you want more speed and do not mind a softer picture. `PIXEL_OFFLOAD=1|2` selects 640×400 or 512×320 outright, and the browser's WebGPU stage sharpens the upscale so a smaller framebuffer stays legible — the **GPU** button in the toolbar turns that stage on or off
 - Conservative Java defaults (512 MiB initial, 1.5 GiB maximum)
 - Minecraft instance preconfigured for software rendering: fullscreen on the 800×500 desktop, 2.5 GiB heap, 3 chunk render distance, fast graphics, no clouds or entity shadows
 - Docker health check and GitHub Actions image-build workflow
@@ -97,6 +97,7 @@ Environment variables that control the cost of the desktop and the streamer:
 - `VNC_WAIT` and `VNC_DEFER` (default `16` and `30`, milliseconds) — how often x11vnc polls the framebuffer and how long it batches damage before encoding. Together they put the stream at about 20 updates a second and let one encode carry a whole batch instead of two encodes carrying half of it each, which is noticeably less CPU than the old `8`/`12` for the same picture. Lower values cost more CPU and buy a few milliseconds of latency; `VNC_WAIT=5 VNC_DEFER=5` is the twitchy old setting if the stream feels laggy on a fast app allocation.
 - `MALLOC_ARENA_MAX` (default `2`) — caps glibc's per-thread allocation arenas. Java, Mesa and GTK all allocate from many threads and the default is one arena per core, which costs RSS and page faults for nothing here.
 - `LP_NUM_THREADS` — llvmpipe's worker count, already derived from the container's CPU quota.
+- `PIXEL_OFFLOAD` — `1` or `2` shrinks the framebuffer to 640×400 or 512×320 when `SCREEN_WIDTH` / `SCREEN_HEIGHT` still hold the shipped 800×500. That is 36% and 59% fewer pixels for llvmpipe to shade and for x11vnc to read and encode, which is the only pixel-side saving left once RenderScale has already cut the world. Pair it with the **GPU** upscale in the browser, which is what stops the smaller picture looking soft. An explicit `SCREEN_WIDTH` / `SCREEN_HEIGHT` always wins over the preset.
 
 ## Resource recommendations for a 6 GB / 150% CPU team pool
 
@@ -124,11 +125,13 @@ What CloudPC already does for you:
 
 ### What the browser does, and what it cannot do
 
-Minecraft's own rendering cannot be moved into the iPad or phone browser: the game runs on the desktop, the desktop has no GPU, so llvmpipe shades every pixel on the container's CPU and the browser only ever sees the result as a stream. There is no way to hand the world geometry to the browser's WebGL — Minecraft has no such mode, and the world state lives on the server.
+Minecraft's own rendering cannot be moved into the iPad or phone browser: the game runs on the desktop, the desktop has no GPU, so llvmpipe shades every pixel on the container's CPU. Handing the world to the browser would mean replacing the client renderer outright — WebGPU is not OpenGL, and Sodium's fast path leans on GL features WebGPU does not have (multi-draw, persistent mapped buffers, direct state access) — so what CloudPC offloads is everything that happens *after* the pixels exist.
 
-Everything around that picture is already offloaded, and CloudPC pushes what is left towards the browser:
+That last stage is now the device's job, and it is the one part of this pipeline a phone does better than the container: it has a real GPU and battery budget, the container has neither.
 
-- noVNC decompresses each update and scales the 800×500 desktop to the device in the browser. Compositing, scaling and upsampling cost the container nothing.
+- noVNC decompresses each update in a worker and hands the picture to the **GPU stage**, a WebGPU pass that upscales the stream to the device's own pixel grid and then applies a five-tap adaptive unsharp — the same shape as FidelityFX CAS, backing off near black and white so sharpening cannot draw a dark halo around text. The **GPU** button in the toolbar toggles it and the choice is remembered per browser.
+- Because the device can afford that pass, the container can afford to render less: that is what `PIXEL_OFFLOAD` is for, and why a smaller framebuffer is a real saving rather than just a softer picture.
+- With the GPU stage off — or on a browser with no WebGPU, or after a lost device, in which case the stage removes itself — noVNC's canvas is shown directly and the compositor does the scaling, exactly as before. Nothing about input depends on it: the overlay takes no pointer events, so taps still reach the canvas underneath.
 - The **stream quality** button in the toolbar (Fast → Balanced → Sharp) decides how much of the picture compression is left to the desktop. **Fast** (the default) asks x11vnc for no zlib compression and lower JPEG quality: the container stops spending CPU on compression while the browser decodes a larger stream and upscales it. That is the right trade while the CPU is the bottleneck, which it is here, at the cost of bandwidth. **Balanced** is noVNC's usual setting and **Sharp** compresses hardest for the smallest stream and the most server CPU. The choice is remembered per browser.
 - The trackpad sends at most one pointer event per animation frame and the look pad one small request per 50 ms, because Minecraft only reads the mouse 20 times a second. The desktop gets a fraction of the input events it used to have to process, and a look request is handled in-process by `mouseproxy.py` (libXtst), so it costs no process spawn per event.
 
@@ -144,6 +147,8 @@ If it is still slow:
 4. Turn fullscreen off (F11) and keep the game window small: every pixel of the window is shaded on the CPU. Drag-look keeps working in a window.
 5. Close other desktop programs while playing.
 6. Check the container log at boot. The `CloudPC: performance --` line puts the CPU budget, the host's core count, llvmpipe's thread count, the stream timing and the GC choice in one place, and the renderer line above it says who is drawing: `llvmpipe` means no GPU is visible to the container and the CPU is doing all of it; `virgl`, `zink` or a real GPU name means the app does have hardware acceleration and the numbers should be much better. A `softpipe` renderer is a bug worth reporting — it is Mesa's slow fallback, several times slower than llvmpipe.
+
+One lever sits on the device rather than the container: keep the **GPU** upscale on (it is on by default wherever WebGPU exists) and set `PIXEL_OFFLOAD=1` or `2`. That trades framebuffer pixels — and therefore CPU — for upscaling the iPad does itself. It is the cheapest win left, but it is a pixel-side win: it does not touch the JVM, chunk meshing or entity ticking, which is why the numbered list above comes first.
 
 About the mods: **Sodium** is the biggest single change. It replaces Mojang's chunk renderer with one that batches terrain into far fewer GL calls and does much less per-frame work on the CPU, which is the bottleneck here; on a software rasteriser that is usually a clear win, though scenes differ, so if something looks wrong try one session with the Sodium jar removed from `<instance>/.minecraft/mods`. **Lithium** only makes world ticking cheaper and cannot change how anything looks. **ImmediatelyFast** and **BadOptimizations** change nothing you can see. None of them adds CPU: they lower the cost of a frame.
 
