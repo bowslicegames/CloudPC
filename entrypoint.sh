@@ -27,6 +27,33 @@ if [[ -n "$OFFLOAD_WIDTH" && "$SCREEN_WIDTH" = "800" && "$SCREEN_HEIGHT" = "500"
   echo "CloudPC: PIXEL_OFFLOAD=${PIXEL_OFFLOAD} -- desktop ${SCREEN_WIDTH}x${SCREEN_HEIGHT}, the device upscales it."
 fi
 unset OFFLOAD_WIDTH OFFLOAD_HEIGHT
+
+# Xvfb cannot be made larger than the framebuffer it allocated when it started, and
+# no window manager will shrink a window below the minimum the application put in
+# WM_NORMAL_HINTS. Prism's Settings dialog is exactly that case: its minimum height
+# is larger than this desktop, which is why it opens cropped. So the framebuffer is
+# allocated at this ceiling and the desktop is shrunk to the size asked for;
+# fit_windows grows it back towards the ceiling for a window that needs the room and
+# shrinks it again when that window closes. A ceiling costs a few megabytes of
+# memory and no CPU: llvmpipe and the encoder only ever see the current screen size.
+: "${SCREEN_CEILING_WIDTH:=1024}"
+: "${SCREEN_CEILING_HEIGHT:=640}"
+if (( SCREEN_CEILING_WIDTH < SCREEN_WIDTH )); then SCREEN_CEILING_WIDTH="$SCREEN_WIDTH"; fi
+if (( SCREEN_CEILING_HEIGHT < SCREEN_HEIGHT )); then SCREEN_CEILING_HEIGHT="$SCREEN_HEIGHT"; fi
+
+# Desktop left visible around every window, and the titlebar openbox puts above it.
+# Both are in X pixels: they are the room a window leaves the desktop so its edges
+# and its titlebar stay visible and reachable on a touch screen.
+: "${WINDOW_MARGIN:=8}"
+: "${WINDOW_TITLEBAR:=24}"
+
+# Qt and GTK draw at 100% of the pixels they are given, so the layout that fills an
+# 800x500 desktop fills 40% of the area at 512x320, and a dialog that just fits at
+# 800x500 hangs off the smaller screen. Scaling the toolkit UI by the same fraction
+# of the screen keeps the layout a user already knows at every framebuffer size; the
+# device upscales the stream, so the smaller text still arrives legible.
+: "${UI_SCALE:=$(awk -v w="$SCREEN_WIDTH" -v h="$SCREEN_HEIGHT" \
+  'BEGIN { s = w / 800; if (h / 500 < s) s = h / 500; if (s > 1) s = 1; printf "%.2f", s }')}"
 : "${JAVA_MIN_RAM:=512M}"
 : "${JAVA_MAX_RAM:=1536M}"
 # Desktop on top of X: `lite` is openbox plus the launcher (no panel, no wallpaper
@@ -362,13 +389,14 @@ XVFB_PID=""
 DBUS_PID=""
 DESKTOP_PID=""
 PRISM_PID=""
+FIT_WINDOWS_PID=""
 FIT_PID=""
 VNC_PID=""
 WS_PID=""
 PROXY_PID=""
 cleanup() {
   trap - EXIT INT TERM
-  for pid in "$PROXY_PID" "$WS_PID" "$VNC_PID" "$FIT_PID" "$PRISM_PID" "$DESKTOP_PID" "$DBUS_PID" "$XVFB_PID"; do
+  for pid in "$PROXY_PID" "$WS_PID" "$VNC_PID" "$FIT_WINDOWS_PID" "$FIT_PID" "$PRISM_PID" "$DESKTOP_PID" "$DBUS_PID" "$XVFB_PID"; do
     if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
       kill "$pid" 2>/dev/null || true
     fi
@@ -384,29 +412,78 @@ chown root:root /tmp/.X11-unix
 chmod 1777 /tmp/.X11-unix
 rm -f /tmp/.X0-lock /tmp/.X11-unix/X0
 
-echo "CloudPC: starting virtual display ${SCREEN_WIDTH}x${SCREEN_HEIGHT}..."
-runuser -u cloud -- env HOME=/home/cloud DISPLAY=:0 \
-  Xvfb :0 -screen 0 "${SCREEN_WIDTH}x${SCREEN_HEIGHT}x${SCREEN_DEPTH}" \
-  -nolisten tcp -noreset -ac &
-XVFB_PID=$!
+# The X screen's current size, as "W H".
+screen_size() {
+  DISPLAY=:0 xdpyinfo 2>/dev/null \
+    | awk '/dimensions:/ { split($2, d, "x"); print d[1], d[2]; exit }'
+}
 
-DISPLAY_READY=0
-for _ in $(seq 1 60); do
-  if ! kill -0 "$XVFB_PID" 2>/dev/null; then
-    echo "ERROR: Xvfb exited during startup."
-    wait "$XVFB_PID" || true
-    exit 1
-  fi
-  if xdpyinfo -display :0 >/dev/null 2>&1; then
-    DISPLAY_READY=1
-    break
-  fi
-  sleep 0.5
-done
-if [[ "$DISPLAY_READY" != "1" ]]; then
+# Asks the server for a screen size and waits until it is in effect. RANDR can
+# report BadMatch and apply nothing on the first request against a fresh Xvfb
+# screen, so the size is read back rather than trusted from the exit status.
+set_screen_size() {
+  local want_w="$1" want_h="$2" got_w="" got_h="" attempt
+  for attempt in 1 2 3; do
+    DISPLAY=:0 timeout 5 xrandr --fb "${want_w}x${want_h}" >/dev/null 2>&1 || true
+    read -r got_w got_h < <(screen_size) || true
+    if [[ "$got_w" == "$want_w" && "$got_h" == "$want_h" ]]; then
+      return 0
+    fi
+    sleep 0.4
+  done
+  return 1
+}
+
+start_xvfb() {
+  local width="$1" height="$2" attempt
+  rm -f /tmp/.X0-lock /tmp/.X11-unix/X0
+  runuser -u cloud -- env HOME=/home/cloud DISPLAY=:0 \
+    Xvfb :0 -screen 0 "${width}x${height}x${SCREEN_DEPTH}" \
+    -nolisten tcp -noreset -ac &
+  XVFB_PID=$!
+  for attempt in $(seq 1 60); do
+    if ! kill -0 "$XVFB_PID" 2>/dev/null; then
+      return 1
+    fi
+    if xdpyinfo -display :0 >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 0.5
+  done
+  return 1
+}
+
+echo "CloudPC: starting virtual display ${SCREEN_WIDTH}x${SCREEN_HEIGHT} (ceiling ${SCREEN_CEILING_WIDTH}x${SCREEN_CEILING_HEIGHT})..."
+if ! start_xvfb "$SCREEN_CEILING_WIDTH" "$SCREEN_CEILING_HEIGHT"; then
   echo "ERROR: Xvfb did not become ready."
   ps aux | grep '[X]vfb' || true
   exit 1
+fi
+
+# Shrink the display to the size this deployment asked for, before any X client
+# starts so nothing has to lay itself out twice. -noreset keeps the size even while
+# no client is connected to the server.
+SCREEN_NOW_W="" SCREEN_NOW_H=""
+set_screen_size "$SCREEN_WIDTH" "$SCREEN_HEIGHT" || true
+read -r SCREEN_NOW_W SCREEN_NOW_H < <(screen_size) || true
+if [[ "$SCREEN_NOW_W" != "$SCREEN_WIDTH" || "$SCREEN_NOW_H" != "$SCREEN_HEIGHT" ]]; then
+  # The server would not take the smaller size. Streaming a desktop several times
+  # the size that was asked for would cost real CPU on every frame, so restart it
+  # at exactly the requested size instead. The only thing lost is the room to grow a
+  # window later, and the log says which way it went.
+  echo "WARNING: the display would not shrink to ${SCREEN_WIDTH}x${SCREEN_HEIGHT} (it is ${SCREEN_NOW_W:-?}x${SCREEN_NOW_H:-?}). Restarting it at exactly that size; a window with a larger minimum will then stay cropped."
+  if [[ -n "$XVFB_PID" ]] && kill -0 "$XVFB_PID" 2>/dev/null; then
+    kill "$XVFB_PID" 2>/dev/null || true
+    wait "$XVFB_PID" 2>/dev/null || true
+    sleep 1
+  fi
+  if ! start_xvfb "$SCREEN_WIDTH" "$SCREEN_HEIGHT"; then
+    echo "ERROR: Xvfb did not become ready."
+    ps aux | grep '[X]vfb' || true
+    exit 1
+  fi
+  SCREEN_CEILING_WIDTH="$SCREEN_WIDTH"
+  SCREEN_CEILING_HEIGHT="$SCREEN_HEIGHT"
 fi
 
 # One line in the log that says what actually draws the desktop: a render node
@@ -425,7 +502,7 @@ fi
 # desktop can be diagnosed from the log instead of guessed at. nproc is what the
 # host reports, which is why llvmpipe needs the cgroup quota instead of it.
 CPU_BUDGET="$(cgroup_cpu_limit)"
-echo "CloudPC: performance -- ${CPU_BUDGET} CPU core(s) allowed (nproc $(nproc)), llvmpipe ${LP_NUM_THREADS} thread(s), framebuffer ${SCREEN_WIDTH}x${SCREEN_HEIGHT} (PIXEL_OFFLOAD=${PIXEL_OFFLOAD:-0}), stream ${VNC_WAIT}/${VNC_DEFER} ms, Minecraft on Serial GC."
+echo "CloudPC: performance -- ${CPU_BUDGET} CPU core(s) allowed (nproc $(nproc)), llvmpipe ${LP_NUM_THREADS} thread(s), framebuffer ${SCREEN_WIDTH}x${SCREEN_HEIGHT} (PIXEL_OFFLOAD=${PIXEL_OFFLOAD:-0}, UI scale ${UI_SCALE}), stream ${VNC_WAIT}/${VNC_DEFER} ms, Minecraft on Serial GC."
 case "$GL_RENDERER_LINE" in
   *softpipe*)
     echo "WARNING: Mesa is on softpipe, which is several times slower than llvmpipe. Check that libgl1-mesa-dri is installed; GALLIUM_DRIVER=llvmpipe forces the fast rasteriser."
@@ -480,52 +557,137 @@ echo "CloudPC: session bus is listening (${DBUS_ADDRESS%%,guid=*})."
 # because the game resizes itself just after it opens, and never again afterwards,
 # so F11 stays yours. FIT_GAME_WINDOW=0 disables it.
 
-# Prism's own window is not a game window: fit_game_window below only watches for
-# Minecraft. On the shipped 800x500 desktop the launcher is about that size anyway,
-# but PIXEL_OFFLOAD shrinks the desktop underneath it, and a launcher bigger than
-# the framebuffer is shown cropped — the top-left of the window and no way to reach
-# the rest. So it is fitted once, and only when it is actually too big, which leaves
-# a launcher window the user sized themselves alone.
-fit_launcher_window() {
-  local wid="" attempt width="" height="" tries=0
-  for attempt in $(seq 1 40); do
-    wid="$(DISPLAY=:0 xdotool search --onlyvisible --name 'Prism Launcher' 2>/dev/null | head -n1 || true)"
-    if [[ -n "$wid" ]]; then
-      break
-    fi
-    sleep 1
-  done
-  if [[ -z "$wid" ]]; then
-    echo "CloudPC: no Prism Launcher window appeared to fit to ${SCREEN_WIDTH}x${SCREEN_HEIGHT}."
-    return 0
-  fi
-  # Prism restores its own saved geometry a second or so after the window maps,
-  # which undoes a single resize and leaves a window bigger than the framebuffer.
-  # So this keeps checking for a while and fits again while it is still too big,
-  # and says what happened when it stops — either the window settled, or it has a
-  # minimum size that no resize can cross.
-  for attempt in $(seq 1 20); do
-    width="$(DISPLAY=:0 xdotool getwindowgeometry --shell "$wid" 2>/dev/null | sed -n 's/^WIDTH=//p' || true)"
-    height="$(DISPLAY=:0 xdotool getwindowgeometry --shell "$wid" 2>/dev/null | sed -n 's/^HEIGHT=//p' || true)"
-    if [[ ! "$width" =~ ^[0-9]+$ || ! "$height" =~ ^[0-9]+$ ]]; then
-      sleep 1
+# ---------------------------------------------------------------------------
+# Window fitting
+#
+# openbox does not fit anything: a window keeps the size the application asks for,
+# even when that is larger than the framebuffer, and a touch client has no way to
+# reach the edges it hangs over. Prism's Settings dialog is the hard case — its
+# height comes from its page layout's minimum, which grew in Prism 9 — and no window
+# manager can cross that minimum, because Qt publishes it in WM_NORMAL_HINTS and
+# openbox obeys the hint. So two mechanisms, and both are needed:
+#
+#   * every window is moved fully into view and shrunk to leave WINDOW_MARGIN of
+#     desktop around it, so its titlebar and its resize grips stay reachable;
+#   * a window that will not shrink far enough takes the desktop with it: the screen
+#     grows just enough to hold it, never past the ceiling Xvfb allocated at boot,
+#     and comes back as soon as the window is gone.
+#
+# Minecraft is left alone: fit_game_window below gives it the whole framebuffer on
+# purpose, because every pixel there is game. The loop costs a handful of small X
+# queries every two seconds, and only asks a window its name when it is not already
+# where it should be.
+client_windows() {
+  # The windows openbox manages, from its own list. Searching the window tree would
+  # also turn up menus, tooltips and other override-redirect windows, which are not
+  # things a user resizes or moves.
+  DISPLAY=:0 xprop -root -notype _NET_CLIENT_LIST 2>/dev/null \
+    | sed -n 's/.*# *//p' | tr ',' '\n' | tr -d ' ' | sed '/^$/d'
+}
+
+# "x y width height" of a client window, in root coordinates.
+window_geometry() {
+  DISPLAY=:0 xdotool getwindowgeometry --shell "$1" 2>/dev/null \
+    | sed -n 's/^X=//p;s/^Y=//p;s/^WIDTH=//p;s/^HEIGHT=//p' | paste -sd' '
+}
+
+fit_windows() {
+  local margin="${WINDOW_MARGIN}" titlebar="${WINDOW_TITLEBAR}"
+  local wid name state gx gy gw gh sw sh avail_w avail_h
+  local want_w want_h needed_w needed_h target_x target_y warn_key last_warn=""
+  while kill -0 "$XVFB_PID" 2>/dev/null; do
+    read -r sw sh < <(screen_size) || true
+    if [[ ! "$sw" =~ ^[0-9]+$ || ! "$sh" =~ ^[0-9]+$ ]]; then
+      sleep 2
       continue
     fi
-    if (( width <= SCREEN_WIDTH && height <= SCREEN_HEIGHT )); then
-      if (( tries > 0 )); then
-        echo "CloudPC: launcher window settled at ${width}x${height}."
+    # The size this deployment asked for is the floor: growing for a dialog is
+    # temporary, so the screen has to find its way back here when the dialog closes.
+    want_w="$SCREEN_WIDTH"
+    want_h="$SCREEN_HEIGHT"
+    for wid in $(client_windows); do
+      read -r gx gy gw gh < <(window_geometry "$wid") || true
+      if [[ ! "$gx" =~ ^-?[0-9]+$ || ! "$gy" =~ ^-?[0-9]+$ \
+            || ! "$gw" =~ ^[0-9]+$ || ! "$gh" =~ ^[0-9]+$ ]]; then
+        continue
       fi
-      return 0
+      if (( gw < 16 || gh < 16 )); then
+        continue
+      fi
+      avail_w=$(( sw - 2 * margin ))
+      avail_h=$(( sh - titlebar - 2 * margin ))
+      if (( avail_w < 64 )); then avail_w=64; fi
+      if (( avail_h < 64 )); then avail_h=64; fi
+      # Only a window that is not already where it should be costs the extra queries
+      # to identify it, which is most windows most of the time.
+      if (( gw > avail_w || gh > avail_h \
+            || gx < margin || gy < margin + titlebar \
+            || gx > sw - margin - gw || gy > sh - margin - gh )); then
+        name="$(DISPLAY=:0 xdotool getwindowname "$wid" 2>/dev/null || true)"
+        case "$name" in
+          ""|Minecraft*|*[Mm]inecraft*) continue ;;
+        esac
+        # A maximized or fullscreen window is a size the user asked for, and openbox
+        # resizes those itself when the screen changes.
+        state="$(DISPLAY=:0 xprop -id "$wid" -notype _NET_WM_STATE 2>/dev/null || true)"
+        case "$state" in
+          *MAXIMIZED*|*FULLSCREEN*) continue ;;
+        esac
+        # Ask for the smaller size. A window with a minimum simply stays as it was,
+        # which is why the geometry is read again instead of assumed.
+        if (( gw > avail_w || gh > avail_h )); then
+          timeout 5 xdotool windowsize --sync "$wid" \
+            "$(( gw < avail_w ? gw : avail_w ))" \
+            "$(( gh < avail_h ? gh : avail_h ))" >/dev/null 2>&1 || true
+          read -r gx gy gw gh < <(window_geometry "$wid") || true
+          if [[ ! "$gx" =~ ^-?[0-9]+$ || ! "$gy" =~ ^-?[0-9]+$ \
+                || ! "$gw" =~ ^[0-9]+$ || ! "$gh" =~ ^[0-9]+$ ]]; then
+            continue
+          fi
+        fi
+        # Move it fully inside the margin box. The client area sits below openbox's
+        # titlebar, so the frame's top edge is at y - titlebar: placing the client at
+        # margin + titlebar is what leaves the margin above the frame.
+        target_x="$gx"
+        if (( target_x < margin )); then target_x="$margin"; fi
+        if (( target_x > sw - margin - gw )); then target_x="$(( sw - margin - gw ))"; fi
+        if (( target_x < margin )); then target_x="$margin"; fi
+        target_y="$gy"
+        if (( target_y < margin + titlebar )); then target_y="$(( margin + titlebar ))"; fi
+        if (( target_y > sh - margin - gh )); then target_y="$(( sh - margin - gh ))"; fi
+        if (( target_y < margin + titlebar )); then target_y="$(( margin + titlebar ))"; fi
+        if (( target_x != gx || target_y != gy )); then
+          timeout 5 xdotool windowmove --sync "$wid" "$target_x" "$target_y" >/dev/null 2>&1 || true
+        fi
+      fi
+      # Every window left in the loop gets a say in the size of the desktop, whether
+      # it needed changing or not: if only the windows that were resized counted, the
+      # screen would shrink back the moment a grown-for window fitted, and grow again
+      # on the next pass, forever.
+      needed_w=$(( gw + 2 * margin ))
+      needed_h=$(( gh + titlebar + 2 * margin ))
+      if (( needed_w > want_w )); then
+        want_w="$(( needed_w < SCREEN_CEILING_WIDTH ? needed_w : SCREEN_CEILING_WIDTH ))"
+      fi
+      if (( needed_h > want_h )); then
+        want_h="$(( needed_h < SCREEN_CEILING_HEIGHT ? needed_h : SCREEN_CEILING_HEIGHT ))"
+      fi
+      if (( needed_w > SCREEN_CEILING_WIDTH || needed_h > SCREEN_CEILING_HEIGHT )); then
+        warn_key="$wid:$gw:$gh"
+        if [[ "$warn_key" != "$last_warn" ]]; then
+          last_warn="$warn_key"
+          echo "WARNING: window '${name}' keeps a minimum of ${gw}x${gh}, more room than this desktop can grow to (${SCREEN_CEILING_WIDTH}x${SCREEN_CEILING_HEIGHT}), so part of it stays off screen. Raise SCREEN_CEILING_WIDTH and SCREEN_CEILING_HEIGHT to show it whole."
+        fi
+      fi
+    done
+    if (( want_w != sw || want_h != sh )); then
+      echo "CloudPC: desktop ${sw}x${sh} -> ${want_w}x${want_h} for the open window(s)."
+      # A refused resize must not stop the loop: this runs under set -e and a
+      # background job that dies leaves every later window unfitted.
+      set_screen_size "$want_w" "$want_h" || true
     fi
-    if (( tries == 0 )); then
-      echo "CloudPC: launcher window ${wid} is ${width}x${height}, fitting to ${SCREEN_WIDTH}x${SCREEN_HEIGHT}."
-    fi
-    timeout 5 xdotool windowsize --sync "$wid" "$SCREEN_WIDTH" "$SCREEN_HEIGHT" >/dev/null 2>&1 || true
-    timeout 5 xdotool windowmove --sync "$wid" 0 0 >/dev/null 2>&1 || true
-    tries=$((tries + 1))
-    sleep 1
+    sleep 2
   done
-  echo "WARNING: launcher window ${wid} will not go below ${width}x${height} on a ${SCREEN_WIDTH}x${SCREEN_HEIGHT} desktop — that is its minimum size. Use PIXEL_OFFLOAD=1 (640x400), or unset PIXEL_OFFLOAD."
 }
 
 fit_game_window() {
@@ -596,7 +758,12 @@ SESSION_ENV=(HOME=/home/cloud DISPLAY=:0
   LP_NUM_THREADS="$LP_NUM_THREADS"
   MESA_SHADER_CACHE_DIR="$MESA_SHADER_CACHE_DIR"
   MESA_SHADER_CACHE_MAX_SIZE="$MESA_SHADER_CACHE_MAX_SIZE"
-  MALLOC_ARENA_MAX="$MALLOC_ARENA_MAX")
+  MALLOC_ARENA_MAX="$MALLOC_ARENA_MAX"
+  # Every toolkit in the session draws at this fraction of 100% (see UI_SCALE):
+  # Qt for Prism Launcher, GDK for the terminal, Thunar and mousepad.
+  QT_SCALE_FACTOR="$UI_SCALE"
+  GDK_SCALE=1
+  GDK_DPI_SCALE="$UI_SCALE")
 
 if [[ "$SESSION" == "lite" ]] && command -v openbox >/dev/null 2>&1; then
   seed_openbox_menu
@@ -625,9 +792,6 @@ if [[ "$SESSION" == "lite" ]] && command -v openbox >/dev/null 2>&1; then
     runuser -u cloud -- env "${SESSION_ENV[@]}" prismlauncher &
     PRISM_PID=$!
     echo "CloudPC: Prism Launcher started (session memory kept off the game's core)."
-    if command -v xdotool >/dev/null 2>&1; then
-      fit_launcher_window &
-    fi
   else
     echo "CloudPC: AUTOSTART_PRISM=0, right-click the background and pick Prism Launcher."
   fi
@@ -635,6 +799,13 @@ else
   echo "CloudPC: starting XFCE desktop (llvmpipe limited to ${LP_NUM_THREADS} CPU thread(s))..."
   runuser -u cloud -- env "${SESSION_ENV[@]}" startxfce4 &
   DESKTOP_PID=$!
+fi
+
+# Fits every window of the session, the launcher included. Nothing here is a game
+# window, so this is the one that keeps dialogs and the launcher whole on screen.
+if [[ "${FIT_WINDOWS:-1}" == "1" ]] && command -v xdotool >/dev/null 2>&1; then
+  fit_windows &
+  FIT_WINDOWS_PID=$!
 fi
 
 if [[ "${FIT_GAME_WINDOW:-1}" == "1" ]] && command -v xdotool >/dev/null 2>&1; then
