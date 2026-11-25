@@ -22,7 +22,7 @@ RUN printf '%s\n' \
  && apt-get install -y --no-install-recommends \
       ca-certificates curl wget gnupg \
       xvfb x11vnc novnc websockify x11-utils \
-      openbox xdotool \
+      openbox xdotool libxtst6 \
       xfce4-session xfce4-panel xfce4-terminal xfdesktop4 xfwm4 \
       thunar mousepad dbus dbus-x11 \
       fonts-dejavu fonts-liberation \
@@ -40,6 +40,7 @@ RUN printf '%s\n' \
 
 COPY entrypoint.sh /opt/cloudpc/entrypoint.sh
 COPY healthcheck.sh /opt/cloudpc/healthcheck.sh
+COPY mouseproxy.py /opt/cloudpc/mouseproxy.py
 COPY dbus-session.conf /opt/cloudpc/dbus-session.conf
 COPY prism/ /opt/cloudpc/prism/
 COPY etc/xdg/xfce4/xfconf/xfce-perchannel-xml/ /etc/xdg/xfce4/xfconf/xfce-perchannel-xml/
@@ -86,7 +87,7 @@ RUN version="$(curl -fsS --max-time 25 https://launchermeta.mojang.com/mc/game/v
  && python3 -c 'import json,sys; path="/opt/cloudpc/prism/instance/mmc-pack.json"; data=json.load(open(path)); data["components"][0]["version"]=sys.argv[1]; json.dump(data, open(path, "w"), indent=2)' "$version" \
  && echo "CloudPC: Prism instance pinned to Minecraft ${version}"
 
-RUN chmod +x /opt/cloudpc/entrypoint.sh /opt/cloudpc/healthcheck.sh \
+RUN chmod +x /opt/cloudpc/entrypoint.sh /opt/cloudpc/healthcheck.sh /opt/cloudpc/mouseproxy.py \
  && rm -f /usr/share/novnc/vnc.html /usr/share/novnc/vnc_lite.html
 
 EXPOSE 8080

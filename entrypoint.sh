@@ -2,6 +2,10 @@
 set -Eeuo pipefail
 
 : "${NOVNC_PORT:=8080}"
+# websockify listens here, on loopback only: the port the app exposes belongs to
+# mouseproxy.py, which serves noVNC's files, relays that websocket and injects the
+# relative mouse motion the look pad needs.
+: "${WS_PORT:=8081}"
 : "${VNC_PORT:=5900}"
 : "${SCREEN_WIDTH:=800}"
 : "${SCREEN_HEIGHT:=500}"
@@ -108,21 +112,17 @@ if [[ -f "$INSTANCE_CFG" ]] && ! grep -q '^OverrideWindow=' "$INSTANCE_CFG"; the
   printf 'OverrideWindow=true\nMinecraftWinWidth=800\nMinecraftWinHeight=500\n' >> "$INSTANCE_CFG"
 fi
 
-# Mouse look needs the game to be fullscreen. While you play, GLFW hides the cursor
-# and pins it to the centre of Minecraft's window, and the game reads the mouse as
-# the distance from that point. The look pad injects "centre of the screen plus
-# this interval's travel", which is only the same thing while the window is the
-# whole screen: a windowed game is off by the distance between the two centres,
-# and that fixed offset is added on every tick, so the camera slides one way no
-# matter which way the drag goes. Fullscreen makes both centres one pixel, so the
-# offset is zero by construction. Flipped once, with a marker, so turning
-# fullscreen off in game (F11) stays off.
+# The seeded instance starts fullscreen so the stream is all game and every pixel
+# the encoder sends is one Minecraft drew. Mouse look does not depend on it any
+# more -- the look pad sends relative motion (see mouseproxy.py), which works in a
+# window too -- so this is about the picture, not the controls. Flipped once, with
+# a marker, so turning fullscreen off in game (F11) stays off.
 INSTANCE_OPTIONS="$INSTANCE_DIR/options.txt"
 FULLSCREEN_MARKER=/data/.local/share/.cloudpc-fullscreen
 if [[ -f "$INSTANCE_OPTIONS" && ! -e "$FULLSCREEN_MARKER" ]]; then
   if grep -qx 'fullscreen:false' "$INSTANCE_OPTIONS"; then
     sed -i 's/^fullscreen:false$/fullscreen:true/' "$INSTANCE_OPTIONS"
-    echo "CloudPC: Minecraft set to fullscreen so mouse look has a fixed centre"
+    echo "CloudPC: Minecraft set to fullscreen so the stream is all game"
   fi
   : > "$FULLSCREEN_MARKER"
 fi
@@ -298,10 +298,11 @@ DESKTOP_PID=""
 PRISM_PID=""
 FIT_PID=""
 VNC_PID=""
-NOVNC_PID=""
+WS_PID=""
+PROXY_PID=""
 cleanup() {
   trap - EXIT INT TERM
-  for pid in "$NOVNC_PID" "$VNC_PID" "$FIT_PID" "$PRISM_PID" "$DESKTOP_PID" "$DBUS_PID" "$XVFB_PID"; do
+  for pid in "$PROXY_PID" "$WS_PID" "$VNC_PID" "$FIT_PID" "$PRISM_PID" "$DESKTOP_PID" "$DBUS_PID" "$XVFB_PID"; do
     if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
       kill "$pid" 2>/dev/null || true
     fi
@@ -390,55 +391,17 @@ fi
 export DBUS_SESSION_BUS_ADDRESS="$DBUS_ADDRESS"
 echo "CloudPC: session bus is listening (${DBUS_ADDRESS%%,guid=*})."
 
-# MineCraft's mouse look reads the distance from the centre of its own window, while
-# the look pad in index.html injects "centre of the screen plus this interval's
-# travel". Any fixed gap between those two points is added to every single update,
-# so the camera walks one way no matter which way the drag goes and a drag back
-# cannot cancel it. The game window is therefore forced to the whole screen at 0,0
-# with no decorations: the two centres become one pixel and the offset is zero.
-#
-# This is done from the X side because the game's own fullscreen request is not
-# dependable here: GLFW asks XRandR for a video mode, Xvfb offers few, and xfwm4 or
-# openbox can still decorate the result and shift the client area down by a titlebar.
-# The geometry is applied once per Minecraft window, retried a few times because the
-# game resizes itself just after it opens, and never again afterwards, so F11 stays
-# yours.
-#
-# Whatever the window ends up being, its real rectangle is published to
-# /usr/share/novnc/cloudpc-game.json every two seconds for the browser to read: the
-# look pad injects "a point plus travel" and Minecraft reads the mouse as the offset
-# from its own window's centre, so the page uses this rectangle instead of assuming
-# where the game is. That also keeps the update inside the window, where noVNC will
-# not clamp it to a corner and throw the direction of the drag away.
-# It is applied once per window so F11 still works, and FIT_GAME_WINDOW=0 disables it.
-GAME_GEO_JSON=/usr/share/novnc/cloudpc-game.json
-
-write_game_geo() { # x y w h
-  local tmp="${GAME_GEO_JSON}.tmp"
-  printf '{"x":%s,"y":%s,"w":%s,"h":%s}\n' "$1" "$2" "$3" "$4" >"$tmp" 2>/dev/null || return 0
-  chmod 644 "$tmp" 2>/dev/null || true
-  mv -f "$tmp" "$GAME_GEO_JSON" 2>/dev/null || true
-}
-
-write_game_none() {
-  local tmp="${GAME_GEO_JSON}.tmp"
-  printf '{"none":true}\n' >"$tmp" 2>/dev/null && mv -f "$tmp" "$GAME_GEO_JSON" 2>/dev/null || true
-}
-
-# Sets G_X G_Y G_W G_H from the window, without eval-ing anything.
-read_game_geo() {
-  local key value
-  G_X=0 G_Y=0 G_W=0 G_H=0
-  while IFS='=' read -r key value; do
-    case "$key" in
-      X) G_X="$value" ;;
-      Y) G_Y="$value" ;;
-      WIDTH) G_W="$value" ;;
-      HEIGHT) G_H="$value" ;;
-    esac
-  done < <(timeout 5 xdotool getwindowgeometry --shell "$1" 2>/dev/null || true)
-  [[ "$G_W" =~ ^[0-9]+$ && "$G_H" =~ ^[0-9]+$ ]] && (( G_W > 0 && G_H > 0 ))
-}
+# Mouse look does not depend on this any more: index.html sends the travel to
+# /cloudpc/mouse and mouseproxy.py moves the pointer by exactly that much as
+# relative motion, which is the only thing the game reads. Fitting the window is
+# still worth doing for a windowed game, because the stream is the phone's whole
+# world: an unfitted window leaves desktop furniture around the game and shrinks
+# it below the pixels the encoder is already sending. The game's own fullscreen
+# request is not dependable here (GLFW asks XRandR for a video mode, Xvfb offers
+# few, and openbox can still add a titlebar that shifts the client area down), so
+# the geometry is set directly, once per Minecraft window, retried a few times
+# because the game resizes itself just after it opens, and never again afterwards,
+# so F11 stays yours. FIT_GAME_WINDOW=0 disables it.
 
 fit_game_window() {
   local wid="" last="" attempt geometry
@@ -447,7 +410,6 @@ fit_game_window() {
     if [[ -z "$wid" ]]; then
       if [[ -n "$last" ]]; then
         echo "CloudPC: game window closed"
-        write_game_none
         last=""
       fi
       sleep 2
@@ -469,9 +431,6 @@ fit_game_window() {
       done
       geometry="$(DISPLAY=:0 xdotool getwindowgeometry --shell "$wid" 2>/dev/null | tr '\n' ' ' || true)"
       echo "CloudPC: game window ${wid} fitted to ${SCREEN_WIDTH}x${SCREEN_HEIGHT} at 0,0 (${geometry:-geometry unknown})"
-    fi
-    if read_game_geo "$wid"; then
-      write_game_geo "$G_X" "$G_Y" "$G_W" "$G_H"
     fi
     sleep 2
   done
@@ -600,15 +559,45 @@ if [[ "$VNC_READY" != "1" ]]; then
   exit 1
 fi
 
-echo "CloudPC: starting noVNC/websockify on 0.0.0.0:${NOVNC_PORT}..."
-websockify --web=/usr/share/novnc "0.0.0.0:${NOVNC_PORT}" "127.0.0.1:${VNC_PORT}" &
-NOVNC_PID=$!
+# websockify only has to carry the RFB socket now; noVNC's files and the mouse
+# endpoint are served by mouseproxy.py on the exposed port, in front of it.
+echo "CloudPC: starting websockify on 127.0.0.1:${WS_PORT}..."
+websockify "127.0.0.1:${WS_PORT}" "127.0.0.1:${VNC_PORT}" &
+WS_PID=$!
+
+WS_READY=0
+for _ in $(seq 1 40); do
+  if ! kill -0 "$WS_PID" 2>/dev/null; then
+    echo "ERROR: websockify exited during startup."
+    wait "$WS_PID" || true
+    exit 1
+  fi
+  if (echo >/dev/tcp/127.0.0.1/"${WS_PORT}") >/dev/null 2>&1; then
+    WS_READY=1
+    break
+  fi
+  sleep 0.5
+done
+if [[ "$WS_READY" != "1" ]]; then
+  echo "ERROR: websockify did not listen on 127.0.0.1:${WS_PORT}."
+  ps aux | grep '[w]ebsockify' || true
+  exit 1
+fi
+
+echo "CloudPC: starting noVNC and relative mouse on 0.0.0.0:${NOVNC_PORT}..."
+runuser -u cloud -- env HOME=/home/cloud DISPLAY=:0 \
+  CLOUDPC_WEB_ROOT=/usr/share/novnc \
+  CLOUDPC_WS_UPSTREAM="127.0.0.1:${WS_PORT}" \
+  NOVNC_PORT="${NOVNC_PORT}" \
+  CLOUDPC_DISPLAY=:0 \
+  python3 /opt/cloudpc/mouseproxy.py &
+PROXY_PID=$!
 
 NOVNC_READY=0
 for _ in $(seq 1 40); do
-  if ! kill -0 "$NOVNC_PID" 2>/dev/null; then
-    echo "ERROR: websockify exited during startup."
-    wait "$NOVNC_PID" || true
+  if ! kill -0 "$PROXY_PID" 2>/dev/null; then
+    echo "ERROR: mouseproxy exited during startup."
+    wait "$PROXY_PID" || true
     exit 1
   fi
   if (echo >/dev/tcp/127.0.0.1/"${NOVNC_PORT}") >/dev/null 2>&1; then
@@ -618,19 +607,19 @@ for _ in $(seq 1 40); do
   sleep 0.5
 done
 if [[ "$NOVNC_READY" != "1" ]]; then
-  echo "ERROR: websockify did not listen on 127.0.0.1:${NOVNC_PORT}."
-  ps aux | grep '[w]ebsockify' || true
+  echo "ERROR: mouseproxy did not listen on 127.0.0.1:${NOVNC_PORT}."
+  ps aux | grep '[m]ouseproxy' || true
   exit 1
 fi
 
-echo "CloudPC: noVNC is listening on port ${NOVNC_PORT}; VNC password authentication is enabled."
+echo "CloudPC: noVNC is listening on port ${NOVNC_PORT}; mouse look uses relative XTEST motion; VNC password authentication is enabled."
 
 # Supervise all core services. If one exits, report which one before shutdown.
 set +e
-wait -n "$XVFB_PID" "$DBUS_PID" "$DESKTOP_PID" "$VNC_PID" "$NOVNC_PID"
+wait -n "$XVFB_PID" "$DBUS_PID" "$DESKTOP_PID" "$VNC_PID" "$WS_PID" "$PROXY_PID"
 status=$?
 set -e
-for name in XVFB DBUS DESKTOP VNC NOVNC; do
+for name in XVFB DBUS DESKTOP VNC WS PROXY; do
   pidvar="${name}_PID"
   pid="${!pidvar}"
   if [[ -n "$pid" ]] && ! kill -0 "$pid" 2>/dev/null; then

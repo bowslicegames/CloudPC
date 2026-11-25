@@ -120,9 +120,8 @@ button[aria-pressed="true"],button.primary{background:var(--accent);color:var(--
 }
 #controls button[data-active="1"],#trackpad button[data-active="1"]{background:var(--accent);color:var(--accent-ink)}
 
-/* What the look path is actually sending: the point on the desktop, the travel that
- * produced it, and the game window the container measured. Small, read-only, and
- * only while the game overlay is on. */
+/* What the look path is actually doing: the travel just sent and where the desktop
+ * pointer ended up. Small, read-only, and only while the game overlay is on. */
 #lookDebug{
   position:absolute;left:calc(8px + env(safe-area-inset-left));top:8px;z-index:27;
   max-width:calc(100% - 16px);padding:4px 8px;border-radius:8px;
@@ -362,84 +361,26 @@ function ensureCursor() {
   return cursor;
 }
 
-/* Where the game really is on the desktop.
+/* Where a button press is aimed.
  *
- * Every look update is "a point plus this interval's travel", and Minecraft reads
- * the mouse as the offset from the centre of its own window. If that point is not
- * the centre of that window, the difference is a constant, it is added to every
- * single update, and the camera walks one way whichever way you swipe — a swipe the
- * other way only subtracts a little from the walk. Rather than assume anything, the
- * container measures the game window and writes it to cloudpc-game.json (see
- * fit_game_window in entrypoint.sh) and this reads it back, so the point is the
- * measured centre and the difference is zero by construction.
+ * Look itself no longer needs a point on the desktop: it sends relative travel (see
+ * the look section further down), so there is no centre to get wrong and no clamping
+ * to lose the direction of a drag. A press is different — a button down is only ever
+ * an absolute RFB event — so in the game overlay it goes to the middle of the
+ * streamed canvas, clamped inside it. The container fits the game window to the
+ * screen, so that point is inside the game; with a menu open it is the middle of the
+ * menu. On the trackpad it stays the trackpad's own cursor.
  *
- * The other way this ends up one-directional is noVNC's own coordinate handling: it
- * clamps anything outside the canvas to the canvas's last pixel, and a clamped point
- * has lost the sign of the drag. Every update is therefore clamped inside the game
- * window here, in the browser, before it is sent. */
-let gameRect = null; /* framebuffer pixels */
-let gameRectFetchAt = -Infinity;
-
-function refreshGameRect() {
-  const now = performance.now();
-  if (now - gameRectFetchAt < 1500) return;
-  gameRectFetchAt = now;
-  fetch("cloudpc-game.json", { cache: "no-store" })
-    .then(response => (response.ok ? response.json() : null))
-    .then(data => {
-      if (!data) return;
-      if (data.none) { gameRect = null; return; }
-      const w = Number(data.w);
-      const h = Number(data.h);
-      if (Number.isFinite(w) && w > 0 && Number.isFinite(h) && h > 0) {
-        gameRect = { x: Number(data.x) || 0, y: Number(data.y) || 0, w, h };
-      }
-    })
-    .catch(() => { /* not served, so fall back to the whole screen */ });
-}
-
-function framebufferSize() {
+ * A windowed game keeps working: while the pointer is grabbed, Minecraft only cares
+ * that a button went down, not where, and the window is still fitted to the screen
+ * for the stream's sake (fit_game_window in entrypoint.sh). */
+function clickPoint() {
   const rect = canvasRect();
-  return {
-    w: canvas && canvas.width ? canvas.width : (rect ? rect.width : 0),
-    h: canvas && canvas.height ? canvas.height : (rect ? rect.height : 0),
-  };
+  if (!rect) return null;
+  return clampToCanvas(rect.left + rect.width / 2, rect.top + rect.height / 2);
 }
 
-function framebufferToClient(fx, fy) {
-  const rect = canvasRect();
-  const fb = framebufferSize();
-  if (!rect || !fb.w || !fb.h) return null;
-  return {
-    x: rect.left + (fx / fb.w) * rect.width,
-    y: rect.top + (fy / fb.h) * rect.height,
-  };
-}
-
-/* The rectangle the look updates may use: the game window when it is known, the
- * whole screen otherwise. */
-function lookBox() {
-  if (gameRect) return gameRect;
-  const fb = framebufferSize();
-  return { x: 0, y: 0, w: fb.w, h: fb.h };
-}
-
-function lookCentre() {
-  const box = lookBox();
-  return framebufferToClient(box.x + box.w / 2, box.y + box.h / 2);
-}
-
-/* The game overlay locks the pointer to the middle of the game window, which is
- * exactly where Minecraft pins its hidden cursor while it plays, so a press arrives
- * with no travel attached and a click never drags the camera. */
-function lockPoint() {
-  const centre = lookCentre();
-  if (!centre) return null;
-  cursor = clampToCanvas(centre.x, centre.y);
-  return cursor;
-}
-
-function gamePoint() { return mode === "game" ? lockPoint() : ensureCursor(); }
+function gamePoint() { return mode === "game" ? clickPoint() : ensureCursor(); }
 
 /* Every pointer event costs the desktop an XTest motion that x11vnc then has to
  * process, and the desktop CPU is the scarce resource here. The remote server
@@ -709,15 +650,12 @@ function setMode(next) {
   syncLock();
 }
 
-/* What the lock looks like from this side: no remote cursor dot while the overlay
- * owns the pointer, and the pointer parked on the lock point the moment the
- * overlay comes up. */
+/* No remote cursor dot while the overlay owns the pointer: the overlay is turning the
+ * camera, not pointing at things, and the game hides the cursor anyway. */
 function syncLock() {
-  if (mode === "game") refreshGameRect();
   if (rfb) {
     try { rfb.showDotCursor = mode !== "game"; } catch { /* older noVNC */ }
   }
-  if (mode === "game") lockPoint();
 }
 
 for (const button of controlsEl.querySelectorAll("button[data-key]")) {
@@ -767,30 +705,72 @@ function remotePixelsPerCssPixel() {
   return canvas.width / canvas.clientWidth || 1;
 }
 
-/* The look surface is relative, while the trackpad above stays absolute.
+/* ---------- look: real relative motion, injected on the desktop ----------
  *
- * Minecraft grabs the pointer while you play and pulls it back to the middle of
- * its window on every client tick, so the only thing it can read is how far the
- * cursor sits from that middle. A cumulative cursor that is clamped to the screen
- * is why looking up used to die once the pointer hit the top edge; each update is
- * now "middle of the screen plus this interval's travel", so every direction
- * always has a full half screen of room and can never run out.
+ * RFB carries absolute pointer positions only, so a look update used to be "a point
+ * on the desktop". Minecraft does not read a pointer, though: it reads the mouse as
+ * the distance from the centre of its own window, where it pins the hidden cursor
+ * while you play. Any point that is not exactly that centre leaves a constant
+ * difference which every single update adds, so the camera walks one way whatever
+ * the finger does, and dragging back only subtracts a little from the walk. noVNC
+ * adds to it by clamping points outside the canvas to its last pixel, which throws
+ * the sign of the drag away as well.
  *
- * That middle must be the very point Minecraft pins the hidden cursor to, which is
- * the middle of its window, so the game runs fullscreen on this desktop: both
- * middles are then the same pixel. A windowed game sits wherever the window manager
- * put it, the gap between the two is added to every update, and the camera slides
- * that one way no matter which way the finger goes.
+ * So look no longer sends a position at all. The travel goes to /cloudpc/mouse and
+ * the container moves the X pointer by exactly that much as relative motion (XTEST;
+ * see mouseproxy.py): the game reads the delta and nothing else, so a drag left is
+ * the exact opposite of a drag right and the camera comes back. Where the window is,
+ * whether it is fullscreen and how the stream is scaled no longer matter, and the
+ * trackpad below still drives the cursor absolutely as before.
  *
  * Minecraft reads the mouse 20 times a second no matter what the frame rate is,
  * so movement is collected and sent at that rate: the same turning speed at 5 or
- * 60 fps, one input event per tick instead of dozens for the server to process,
- * and nothing lost, because travel that has not been sent yet stays queued. */
+ * 60 fps, one small request per tick instead of dozens, and nothing lost, because
+ * travel that has not been sent yet stays queued. */
 const LOOK_INTERVAL = 50;
+const LOOK_URL = "/cloudpc/mouse";
 let look = null;
 let lookTimer = 0;
 let lookSentAt = 0;
+let lookOk = 0;
+let lookFail = 0;
+let lookStep = { x: 0, y: 0 };
+let lookPointer = "";
 const lookTravel = { x: 0, y: 0 };
+
+function showLookDebug() {
+  if (lookDebugEl.hidden) return;
+  lookDebugEl.textContent =
+    "look " + lookStep.x + "," + lookStep.y +
+    "  pointer " + (lookPointer || "?") +
+    "\nsent " + lookOk + "  failed " + lookFail;
+}
+
+/* One request per tick. The pointer position the desktop reports back is what tells
+ * a broken look apart from a broken game: if it moves the way the finger went, the
+ * injection works and the problem is above it; if it never moves, it is this side. */
+function sendLook(dx, dy) {
+  const gain = lookGain * remotePixelsPerCssPixel();
+  const stepX = Math.round(dx * gain);
+  const stepY = Math.round(dy * gain);
+  if (!stepX && !stepY) return;
+  lookStep = { x: stepX, y: stepY };
+  fetch(LOOK_URL, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "X-CloudPC": "1" },
+    body: JSON.stringify({ dx: stepX, dy: stepY }),
+    cache: "no-store",
+    keepalive: true,
+  })
+    .then(response => (response.ok ? response.json().catch(() => ({})) : null))
+    .then(data => {
+      if (!data) { lookFail += 1; return; }
+      lookOk += 1;
+      if (Number.isFinite(data.x)) lookPointer = data.x + "," + data.y;
+    })
+    .catch(() => { lookFail += 1; })
+    .then(showLookDebug);
+}
 
 function flushLook() {
   if (lookTimer) { clearTimeout(lookTimer); lookTimer = 0; }
@@ -800,34 +780,7 @@ function flushLook() {
   lookTravel.x = 0;
   lookTravel.y = 0;
   lookSentAt = performance.now();
-  const rect = canvasRect();
-  if (!rect || !canvas) return;
-  refreshGameRect();
-  const centre = lookCentre();
-  const fb = framebufferSize();
-  if (!centre || !fb.w || !fb.h) return;
-  const box = lookBox();
-  const perFbX = rect.width / fb.w; /* CSS pixels per desktop pixel */
-  const perFbY = rect.height / fb.h;
-  const gain = lookGain * remotePixelsPerCssPixel();
-  /* Stay a few desktop pixels inside the game window: a point outside it is clamped
-   * by noVNC to the window edge, and a clamped point no longer carries the direction
-   * of the drag. */
-  const limitX = Math.max(1, (box.w / 2 - 3) * perFbX);
-  const limitY = Math.max(1, (box.h / 2 - 3) * perFbY);
-  const within = (value, limit) => Math.max(-limit, Math.min(limit, value));
-  const x = centre.x + within(dx * gain, limitX);
-  const y = centre.y + within(dy * gain, limitY);
-  cancelMove();
-  cursor = { x, y };
-  dispatchMouse("mousemove", x, y, 0, 0);
-  if (!lookDebugEl.hidden) {
-    lookDebugEl.textContent =
-      "look " + Math.round((x - rect.left) / perFbX) + "," +
-      Math.round((y - rect.top) / perFbY) +
-      "  travel " + Math.round(dx) + "," + Math.round(dy) +
-      "\nwin " + box.x + "," + box.y + " " + box.w + "x" + box.h;
-  }
+  sendLook(dx, dy);
 }
 
 function queueLook() {
@@ -867,11 +820,6 @@ function endLook(event) {
   if (!look || event.pointerId !== look.id) return;
   look = null;
   flushLook(); /* send the tail of the drag straight away */
-  /* Then put the pointer back on the lock point, but only once the tail has been
-   * read: an update sent now would replace it before Minecraft's next tick. */
-  setTimeout(() => {
-    if (!look && !lookTravel.x && !lookTravel.y && mode === "game") lockPoint();
-  }, LOOK_INTERVAL);
 }
 window.addEventListener("pointerup", endLook);
 window.addEventListener("pointercancel", endLook);
