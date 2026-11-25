@@ -19,6 +19,7 @@
   --stick:148px;
   --knob:62px;
   --action:56px;
+  --hotbar:44px;
   font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
 }
 *{box-sizing:border-box}
@@ -70,7 +71,7 @@ button[aria-pressed="true"],button.primary{background:var(--accent);color:var(--
 
 /* Movement: the whole left half is the stick zone, the ring appears where the
  * thumb lands so it never has to be aimed at a fixed corner. */
-#stickZone{position:absolute;inset:0 54% 0 0;pointer-events:auto;touch-action:none}
+#stickZone{position:absolute;inset:0 54% calc(var(--hotbar) + 26px) 0;pointer-events:auto;touch-action:none}
 #stick{
   position:absolute;left:calc(16px + env(safe-area-inset-left));bottom:calc(16px + env(safe-area-inset-bottom));
   width:var(--stick);height:var(--stick);border-radius:50%;opacity:.8;
@@ -88,7 +89,7 @@ button[aria-pressed="true"],button.primary{background:var(--accent);color:var(--
 #lookside{
   position:absolute;inset:0 0 0 54%;pointer-events:auto;touch-action:none;cursor:none;
   display:flex;flex-direction:column;align-items:flex-end;justify-content:flex-end;gap:8px;
-  padding:8px calc(14px + env(safe-area-inset-right)) calc(14px + env(safe-area-inset-bottom)) 10px;
+  padding:8px calc(14px + env(safe-area-inset-right)) calc(var(--hotbar) + 30px + env(safe-area-inset-bottom)) 10px;
 }
 #lookside .lookspeed{
   display:flex;align-items:center;gap:8px;max-width:100%;margin:0;padding:2px 10px;border-radius:999px;
@@ -103,6 +104,20 @@ button[aria-pressed="true"],button.primary{background:var(--accent);color:var(--
   pointer-events:auto;touch-action:none;backdrop-filter:blur(6px);
 }
 #lookside .actgrid button[data-mouse]{font-size:12.5px;font-weight:700}
+
+/* Hotbar: the nine slots along the bottom, where Minecraft's own bar sits. It is a
+ * strip of its own rather than part of the look half, so reaching for a slot never
+ * turns the camera, and the look half's buttons are padded to sit above it. */
+#hotbar{
+  position:absolute;z-index:26;display:flex;justify-content:center;gap:6px;
+  left:calc(8px + env(safe-area-inset-left));right:calc(8px + env(safe-area-inset-right));
+  bottom:calc(8px + env(safe-area-inset-bottom));pointer-events:none;
+}
+#hotbar button{
+  flex:0 1 var(--hotbar);width:var(--hotbar);min-width:0;height:var(--hotbar);padding:0;
+  border-radius:12px;background:rgba(34,48,74,.62);font-size:13px;font-weight:700;
+  pointer-events:auto;touch-action:none;backdrop-filter:blur(6px);
+}
 #controls button[data-active="1"],#trackpad button[data-active="1"]{background:var(--accent);color:var(--accent-ink)}
 
 /* ---------- password prompt ---------- */
@@ -115,7 +130,8 @@ button[aria-pressed="true"],button.primary{background:var(--accent);color:var(--
 #passwordPrompt .row{display:flex;gap:8px;justify-content:flex-end;flex-wrap:wrap}
 #vk{position:fixed;left:0;bottom:0;width:1px;height:1px;padding:0;border:0;opacity:0}
 @media (max-width:480px){
-  :root{--stick:126px;--knob:54px;--action:50px}
+  :root{--stick:126px;--knob:54px;--action:50px;--hotbar:38px}
+  #hotbar{gap:4px}
   #toolbar{font-size:13px}
   #toolbar strong{display:none}
   #trackpad .hint{font-size:11px}
@@ -175,6 +191,17 @@ button[aria-pressed="true"],button.primary{background:var(--accent);color:var(--
         <button type="button" data-mouse="2">RMB</button>
         <button type="button" data-key="Space">Jump</button>
       </div>
+    </div>
+    <div id="hotbar" role="group" aria-label="Hotbar">
+      <button type="button" data-key="Digit1">1</button>
+      <button type="button" data-key="Digit2">2</button>
+      <button type="button" data-key="Digit3">3</button>
+      <button type="button" data-key="Digit4">4</button>
+      <button type="button" data-key="Digit5">5</button>
+      <button type="button" data-key="Digit6">6</button>
+      <button type="button" data-key="Digit7">7</button>
+      <button type="button" data-key="Digit8">8</button>
+      <button type="button" data-key="Digit9">9</button>
     </div>
   </div>
 </div>
@@ -322,6 +349,19 @@ function ensureCursor() {
   return cursor;
 }
 
+/* The game overlay locks the pointer to the middle of the game window. In
+ * fullscreen that is the middle of the screen, which is exactly where Minecraft
+ * pins its hidden cursor while it plays, so a press arrives with no travel
+ * attached and a click never drags the camera. */
+function lockPoint() {
+  const rect = canvasRect();
+  if (!rect) return null;
+  cursor = { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
+  return cursor;
+}
+
+function gamePoint() { return mode === "game" ? lockPoint() : ensureCursor(); }
+
 /* Every pointer event costs the desktop an XTest motion that x11vnc then has to
  * process, and the desktop CPU is the scarce resource here. The remote server
  * only ever sees the pointer position it reads next, so all the movements inside
@@ -357,7 +397,7 @@ function moveCursorBy(dx, dy) {
 }
 
 function clickMouse(button) {
-  const position = ensureCursor();
+  const position = gamePoint();
   if (!position) return;
   /* a queued move would land after the click and drag the cursor away */
   cancelMove();
@@ -370,7 +410,7 @@ function clickMouse(button) {
 /* Minecraft needs a button that stays down to mine a block or place a stack, so
  * the overlay's LMB/RMB are held for as long as a finger is on them. */
 function pressMouse(button) {
-  const position = ensureCursor();
+  const position = gamePoint();
   if (!position) return;
   cancelMove();
   const mask = button === 2 ? 2 : button === 3 ? 4 : 1;
@@ -379,13 +419,13 @@ function pressMouse(button) {
 }
 
 function releaseMouse(button) {
-  const position = ensureCursor();
+  const position = gamePoint();
   if (!position) return;
   dispatchMouse("mouseup", position.x, position.y, 0, button || 0);
 }
 
 function scrollAtCursor(deltaY) {
-  const position = ensureCursor();
+  const position = gamePoint();
   if (!position || !canvas) return;
   canvas.dispatchEvent(new WheelEvent("wheel", {
     clientX: position.x, clientY: position.y, deltaY, deltaMode: 0, buttons: 0,
@@ -586,6 +626,17 @@ function setMode(next) {
   if (mode === "trackpad") ensureCursor();
   if (mode !== "trackpad") trackReset();
   if (mode !== "game") gameReset();
+  syncLock();
+}
+
+/* What the lock looks like from this side: no remote cursor dot while the overlay
+ * owns the pointer, and the pointer parked on the lock point the moment the
+ * overlay comes up. */
+function syncLock() {
+  if (rfb) {
+    try { rfb.showDotCursor = mode !== "game"; } catch { /* older noVNC */ }
+  }
+  if (mode === "game") lockPoint();
 }
 
 for (const button of controlsEl.querySelectorAll("button[data-key]")) {
@@ -718,6 +769,11 @@ function endLook(event) {
   if (!look || event.pointerId !== look.id) return;
   look = null;
   flushLook(); /* send the tail of the drag straight away */
+  /* Then put the pointer back on the lock point, but only once the tail has been
+   * read: an update sent now would replace it before Minecraft's next tick. */
+  setTimeout(() => {
+    if (!look && !lookTravel.x && !lookTravel.y && mode === "game") lockPoint();
+  }, LOOK_INTERVAL);
 }
 window.addEventListener("pointerup", endLook);
 window.addEventListener("pointercancel", endLook);
@@ -932,6 +988,7 @@ function connect() {
     connection.addEventListener("connect", () => {
       adoptCanvas(connection);
       applyStreamMode(connection);
+      syncLock();
       statusEl.textContent = "Connected";
       reconnectBtn.style.display = "none";
     });

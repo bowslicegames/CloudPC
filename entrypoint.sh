@@ -42,6 +42,20 @@ MESA_SHADER_CACHE_DIR="${MESA_SHADER_CACHE_DIR:-/data/.cache/mesa}"
 MESA_SHADER_CACHE_MAX_SIZE="${MESA_SHADER_CACHE_MAX_SIZE:-512M}"
 export LP_NUM_THREADS MESA_SHADER_CACHE_DIR MESA_SHADER_CACHE_MAX_SIZE
 
+# Two driver-level knobs that cost nothing: never wait for a display refresh (the
+# swap only feeds a framebuffer that x11vnc reads, and Minecraft already runs with
+# vsync off), and leave Mesa's shader cache alone so the LLVM JIT does not rebuild
+# programs it has already compiled.
+export vblank_mode=0 MESA_SHADER_CACHE_DISABLE=false
+# Mesa's threaded GL dispatch moves the OpenGL command stream onto a second thread;
+# that is how Minecraft got its ~30% improvement on Mesa drivers. It only pays while
+# a core is free, so it is opt-in for this container: GLTHREAD=1 in the app
+# environment turns it on.
+if [[ "${GLTHREAD:-0}" == "1" ]]; then
+  export mesa_glthread=true
+  echo "CloudPC: Mesa threaded GL dispatch on (GLTHREAD=1)."
+fi
+
 mkdir -p /data/.vnc /data/.minecraft /data/.local/share/PrismLauncher \
          /data/.config /data/Desktop /data/Downloads "$MESA_SHADER_CACHE_DIR"
 chown -R cloud:cloud /data
@@ -140,7 +154,7 @@ RENDERSCALE_CONFIG="$INSTANCE_DIR/.minecraft/config/renderscale.json"
 
 # RenderScale 1.3.6 is a NeoForge 1.21.11 build. Loading it into anything else is a
 # mod-loading failure that stops Minecraft from starting, so check first.
-renderscale_compatible() {
+mods_compatible() {
   python3 - "$1/mmc-pack.json" <<'PY'
 import json, sys
 try:
@@ -165,7 +179,7 @@ mod_present() {
   find "$1" -maxdepth 1 -iname "$2*.jar" -print -quit | grep -q .
 }
 
-install_renderscale() {
+install_mods() {
   local instance="$1" mods="$1/.minecraft/mods" config="$1/.minecraft/config/renderscale.json" jar base name
   name="$(basename "$instance")"
   mkdir -p "$mods" "$(dirname "$config")"
@@ -214,19 +228,19 @@ PY
   fi
 }
 
-if [[ "${RENDERSCALE:-1}" = "0" ]]; then
-  echo "CloudPC: RENDERSCALE=0, not adding the rendering mods."
+if [[ "${MODS:-1}" = "0" || "${RENDERSCALE:-1}" = "0" ]]; then
+  echo "CloudPC: mods disabled (MODS=0 or RENDERSCALE=0), leaving the instances untouched."
 elif [[ ! -d /opt/cloudpc/mods ]]; then
-  echo "CloudPC: the image has no pinned rendering mods, leaving the instances untouched."
+  echo "CloudPC: the image has no pinned performance mods, leaving the instances untouched."
 else
   # Any instance that can load the builds gets them, not just the seeded one.
   for instance in "$PRISM_DIR"/instances/*/; do
     instance="${instance%/}"
     [[ -f "$instance/mmc-pack.json" ]] || continue
-    if renderscale_compatible "$instance"; then
-      install_renderscale "$instance"
+    if mods_compatible "$instance"; then
+      install_mods "$instance"
     else
-      echo "CloudPC: $(basename "$instance") is not NeoForge 1.21.11, not adding RenderScale to it."
+      echo "CloudPC: $(basename "$instance") is not NeoForge 1.21.11, not adding the performance mods to it."
     fi
   done
 fi
@@ -371,6 +385,11 @@ DESKTOP_PID=$!
 
 # Keep x11vnc output visible: startup failures must be diagnosable in Altare.
 #
+# The encoder runs one notch below Minecraft in CPU priority. The stream can be a
+# few milliseconds late without hurting anything, while the frame the game is
+# drawing cannot wait: on a ~1 CPU container renice is the cheapest way to give the
+# renderer the core when both want it.
+#
 # With -noxdamage x11vnc has no idea which rectangles changed: it re-reads the
 # whole framebuffer every poll, and on a ~1 CPU container that read is slow
 # enough to catch only part of each redraw. The desktop then shows stale halves
@@ -385,7 +404,7 @@ if [[ "${VNC_NO_DAMAGE:-0}" == "1" ]]; then
 fi
 echo "CloudPC: starting password-protected VNC server..."
 runuser -u cloud -- env HOME=/home/cloud DISPLAY=:0 \
-  x11vnc -display :0 -rfbauth "$VNC_PASSWD_FILE" -rfbport "${VNC_PORT}" \
+  nice -n 5 x11vnc -display :0 -rfbauth "$VNC_PASSWD_FILE" -rfbport "${VNC_PORT}" \
   -forever -shared -repeat -localhost -wait 5 -defer 5 \
   "${VNC_EXTRA_ARGS[@]}" &
 VNC_PID=$!
