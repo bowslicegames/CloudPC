@@ -8,6 +8,19 @@ set -Eeuo pipefail
 : "${SCREEN_DEPTH:=24}"
 : "${JAVA_MIN_RAM:=512M}"
 : "${JAVA_MAX_RAM:=1536M}"
+# Desktop on top of X: `lite` is openbox plus the launcher (no panel, no wallpaper
+# daemon, no settings daemons), `xfce` is the full session. SESSION=xfce gets the
+# old desktop back.
+: "${SESSION:=lite}"
+# How long x11vnc sleeps between framebuffer polls and how long it batches damage
+# before encoding. Saving CPU here costs a few milliseconds of stream latency.
+: "${VNC_WAIT:=8}"
+: "${VNC_DEFER:=12}"
+
+# glibc gives every thread its own malloc arena (8 x cores of 64 MB mappings). On
+# a one-core container with Java, Mesa and GTK all allocating, capping the arenas
+# keeps RSS down and the page faults with it.
+export MALLOC_ARENA_MAX="${MALLOC_ARENA_MAX:-2}"
 
 # Minecraft has no GPU here: it draws through Mesa's llvmpipe CPU rasteriser.
 # llvmpipe starts one worker per core and takes that count from the host machine,
@@ -280,11 +293,13 @@ chown cloud:cloud /data/.config/cloudpc-env
 XVFB_PID=""
 DBUS_PID=""
 DESKTOP_PID=""
+PRISM_PID=""
+FIT_PID=""
 VNC_PID=""
 NOVNC_PID=""
 cleanup() {
   trap - EXIT INT TERM
-  for pid in "$NOVNC_PID" "$VNC_PID" "$DESKTOP_PID" "$DBUS_PID" "$XVFB_PID"; do
+  for pid in "$NOVNC_PID" "$VNC_PID" "$FIT_PID" "$PRISM_PID" "$DESKTOP_PID" "$DBUS_PID" "$XVFB_PID"; do
     if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
       kill "$pid" 2>/dev/null || true
     fi
@@ -373,15 +388,121 @@ fi
 export DBUS_SESSION_BUS_ADDRESS="$DBUS_ADDRESS"
 echo "CloudPC: session bus is listening (${DBUS_ADDRESS%%,guid=*})."
 
-echo "CloudPC: starting XFCE desktop (llvmpipe limited to ${LP_NUM_THREADS} CPU thread(s))..."
-runuser -u cloud -- env HOME=/home/cloud DISPLAY=:0 \
-  XDG_RUNTIME_DIR="$XDG_RUNTIME_DIR" \
-  DBUS_SESSION_BUS_ADDRESS="$DBUS_ADDRESS" \
-  LP_NUM_THREADS="$LP_NUM_THREADS" \
-  MESA_SHADER_CACHE_DIR="$MESA_SHADER_CACHE_DIR" \
-  MESA_SHADER_CACHE_MAX_SIZE="$MESA_SHADER_CACHE_MAX_SIZE" \
-  startxfce4 &
-DESKTOP_PID=$!
+# MineCraft's mouse look reads the distance from the centre of its own window, while
+# the look pad in index.html injects "centre of the screen plus this interval's
+# travel". Any fixed gap between those two points is added to every single update,
+# so the camera walks one way no matter which way the drag goes and a drag back
+# cannot cancel it. The game window is therefore forced to the whole screen at 0,0
+# with no decorations: the two centres become one pixel and the offset is zero.
+#
+# This is done from the X side because the game's own fullscreen request is not
+# dependable here: GLFW asks XRandR for a video mode, Xvfb offers few, and xfwm4 or
+# openbox can still decorate the result and shift the client area down by a titlebar.
+# The geometry is applied once per Minecraft window, retried a few times because the
+# game resizes itself just after it opens, and never re-applied afterwards, so F11
+# still works. FIT_GAME_WINDOW=0 disables it.
+fit_game_window() {
+  local wid="" last="" attempt geometry
+  while kill -0 "$XVFB_PID" 2>/dev/null; do
+    wid="$(DISPLAY=:0 xdotool search --onlyvisible --name '^Minecraft' 2>/dev/null | head -n1 || true)"
+    if [[ -n "$wid" && "$wid" != "$last" ]]; then
+      last="$wid"
+      # _MOTIF_WM_HINTS: ask the window manager for no titlebar and no border, so the
+      # client area really is the whole framebuffer and not the framebuffer minus a
+      # titlebar.
+      DISPLAY=:0 xprop -id "$wid" -f _MOTIF_WM_HINTS 32c \
+        -set _MOTIF_WM_HINTS '0x2, 0x0, 0x0, 0x0, 0x0' >/dev/null 2>&1 || true
+      for attempt in 1 2 3; do
+        sleep 1
+        timeout 5 xdotool windowmove --sync "$wid" 0 0 >/dev/null 2>&1 || true
+        timeout 5 xdotool windowsize --sync "$wid" \
+          "$SCREEN_WIDTH" "$SCREEN_HEIGHT" >/dev/null 2>&1 || true
+        timeout 5 xdotool windowraise "$wid" >/dev/null 2>&1 || true
+      done
+      geometry="$(DISPLAY=:0 xdotool getwindowgeometry --shell "$wid" 2>/dev/null | tr '\n' ' ' || true)"
+      echo "CloudPC: game window ${wid} fitted to ${SCREEN_WIDTH}x${SCREEN_HEIGHT} at 0,0 (${geometry:-geometry unknown})"
+    fi
+    sleep 2
+  done
+}
+
+# The lite session is the whole desktop here: openbox holds the windows, and the
+# only thing the user needs on top of it is the launcher. The XFCE stack costs
+# several hundred megabytes of RSS and a handful of always-running daemons
+# (panel, settings, desktop, notify, power, thunar) for a taskbar nobody needs
+# while the game is fullscreen, and that memory and CPU belong to the renderer.
+seed_openbox_menu() {
+  local dir=/data/.config/openbox
+  mkdir -p "$dir"
+  if [[ ! -f "$dir/menu.xml" ]]; then
+    cat > "$dir/menu.xml" <<'MENU'
+<?xml version="1.0" encoding="UTF-8"?>
+<openbox_menu xmlns="http://openbox.org/3.4/menu">
+  <menu id="root-menu" label="CloudPC">
+    <item label="Prism Launcher">
+      <action name="Execute"><command>prismlauncher</command></action>
+    </item>
+    <item label="Terminal">
+      <action name="Execute"><command>xfce4-terminal</command></action>
+    </item>
+    <item label="Files">
+      <action name="Execute"><command>thunar</command></action>
+    </item>
+  </menu>
+</openbox_menu>
+MENU
+    chown -R cloud:cloud "$dir"
+  fi
+}
+
+SESSION_ENV=(HOME=/home/cloud DISPLAY=:0
+  XDG_RUNTIME_DIR="$XDG_RUNTIME_DIR"
+  DBUS_SESSION_BUS_ADDRESS="$DBUS_ADDRESS"
+  LP_NUM_THREADS="$LP_NUM_THREADS"
+  MESA_SHADER_CACHE_DIR="$MESA_SHADER_CACHE_DIR"
+  MESA_SHADER_CACHE_MAX_SIZE="$MESA_SHADER_CACHE_MAX_SIZE"
+  MALLOC_ARENA_MAX="$MALLOC_ARENA_MAX")
+
+if [[ "$SESSION" == "lite" ]] && command -v openbox >/dev/null 2>&1; then
+  seed_openbox_menu
+  echo "CloudPC: starting openbox session (llvmpipe limited to ${LP_NUM_THREADS} CPU thread(s))..."
+  runuser -u cloud -- env "${SESSION_ENV[@]}" openbox &
+  DESKTOP_PID=$!
+
+  WM_READY=0
+  for _ in $(seq 1 40); do
+    if ! kill -0 "$DESKTOP_PID" 2>/dev/null; then
+      echo "ERROR: openbox exited during startup."
+      exit 1
+    fi
+    if DISPLAY=:0 xprop -root -notype _NET_SUPPORTING_WM_CHECK 2>/dev/null | grep -q window; then
+      WM_READY=1
+      break
+    fi
+    sleep 0.25
+  done
+  if [[ "$WM_READY" != "1" ]]; then
+    echo "WARNING: openbox did not claim the root window yet; starting the launcher anyway."
+  fi
+
+  # AUTOSTART_PRISM=0 leaves the desktop empty (right-click the background for the menu).
+  if [[ "${AUTOSTART_PRISM:-1}" == "1" ]] && command -v prismlauncher >/dev/null 2>&1; then
+    runuser -u cloud -- env "${SESSION_ENV[@]}" prismlauncher &
+    PRISM_PID=$!
+    echo "CloudPC: Prism Launcher started (session memory kept off the game's core)."
+  else
+    echo "CloudPC: AUTOSTART_PRISM=0, right-click the background and pick Prism Launcher."
+  fi
+else
+  echo "CloudPC: starting XFCE desktop (llvmpipe limited to ${LP_NUM_THREADS} CPU thread(s))..."
+  runuser -u cloud -- env "${SESSION_ENV[@]}" startxfce4 &
+  DESKTOP_PID=$!
+fi
+
+if [[ "${FIT_GAME_WINDOW:-1}" == "1" ]] && command -v xdotool >/dev/null 2>&1; then
+  fit_game_window &
+  FIT_PID=$!
+fi
 
 # Keep x11vnc output visible: startup failures must be diagnosable in Altare.
 #
@@ -405,7 +526,7 @@ fi
 echo "CloudPC: starting password-protected VNC server..."
 runuser -u cloud -- env HOME=/home/cloud DISPLAY=:0 \
   nice -n 5 x11vnc -display :0 -rfbauth "$VNC_PASSWD_FILE" -rfbport "${VNC_PORT}" \
-  -forever -shared -repeat -localhost -wait 5 -defer 5 \
+  -forever -shared -repeat -localhost -wait "$VNC_WAIT" -defer "$VNC_DEFER" \
   "${VNC_EXTRA_ARGS[@]}" &
 VNC_PID=$!
 

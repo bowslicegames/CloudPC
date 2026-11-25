@@ -7,7 +7,7 @@ A browser-accessible, lightweight Debian desktop intended for an Altare Docker A
 ## Features
 
 - Debian 13 base
-- XFCE desktop, Thunar file manager and terminal
+- A **lite openbox session by default**: window manager plus Prism Launcher and nothing else running, because every megabyte and every idle daemon is CPU and RAM the renderer does not get. `SESSION=xfce` brings the full XFCE desktop (panel, settings daemons, wallpaper, Thunar) back
 - noVNC browser access with a phone- and tablet-friendly client
 - VNC password authentication from the `VNC_PASSWORD` environment variable
 - Touch controls: on-screen keyboard, a trackpad overlay that replaces the mouse for the whole desktop, and a game overlay with a floating movement joystick on the left half, a drag-anywhere look area on the right half, held LMB/RMB plus jump, sneak, sprint, inventory, drop, chat and Esc buttons, and a nine-slot hotbar
@@ -52,7 +52,7 @@ For local testing, the image needs an x86-64 Linux host for the included Prism/J
 
 1. Open the CloudPC web address.
 2. Enter the VNC password: the `VNC_PASSWORD` you set, or the generated one printed in the container logs.
-3. Tap **Prism Launcher** on the desktop (or open it from the XFCE applications menu).
+3. Prism Launcher starts with the session in the default lite mode. If you set `AUTOSTART_PRISM=0`, right-click the desktop background and pick **Prism Launcher**; in `SESSION=xfce` it is on the desktop or in the applications menu.
 4. Add your Microsoft account inside Prism Launcher. Microsoft authentication is handled by Prism Launcher; CloudPC does not collect your credentials.
 5. Open the pre-seeded **Minecraft** instance. It is already pointed at the installed Java 21 executable:
    `/usr/lib/jvm/java-21-openjdk-amd64/bin/java`
@@ -71,17 +71,37 @@ The instance ships as a descriptor only: Prism Launcher downloads that Minecraft
   - While it is on it captures touches, so toggle it off to tap the desktop directly.
 - **🎮** toggles the game overlay, laid out like a phone first-person shooter:
   - The **left half** is a floating joystick. Touch anywhere there and the ring appears under your thumb; drag in any direction and it holds the matching W/A/S/D keys, diagonals included (up-right is W+D), and lifting your finger releases every key it pressed. There is no fixed corner to aim at.
-  - The **right half** turns the camera. Drag anywhere on it — not just on a small pad — and a tap does nothing, so you cannot click by accident. The pointer is **locked to the middle of the game window**: the overlay hides the remote cursor dot, and every drag, press and release is delivered at "middle of the screen plus this tick's travel" and nowhere else, while Minecraft pins its own hidden cursor to that same point every tick. That is why looking up, down and sideways never runs out of room, and why pressing a button never jerks the camera. Movement is sent 20 times a second, which is Minecraft's own mouse rate, so turning speed is the same at 5 or 60 fps.
+  - The **right half** turns the camera. Drag anywhere on it — not just on a small pad — and a tap does nothing, so you cannot click by accident. The pointer is **locked to the middle of the game window**: the overlay hides the remote cursor dot, and every drag, press and release is delivered at "middle of the screen plus this tick's travel" and nowhere else, while Minecraft pins its own hidden cursor to that same point every tick. The container makes sure those two points are the same pixel by forcing the game window to the whole screen at 0,0 with no titlebar whenever a Minecraft window appears, so this no longer depends on the game's own fullscreen request being honoured. That is why looking up, down and sideways never runs out of room, and why pressing a button never jerks the camera. Movement is sent 20 times a second, which is Minecraft's own mouse rate, so turning speed is the same at 5 or 60 fps.
   - **LMB** and **RMB** (bottom row, under your thumb) stay held down while your finger is on them, which is what mining a block, attacking or placing a stack needs. **Jump** is next to them, and **Drop**, **Chat**, **Esc**, **Sneak**, **Sprint** and **Inv** fill the two rows above, all press-and-hold.
   - The **hotbar row** along the bottom is slots 1–9, where Minecraft's own bar sits. Each one presses its number key while your finger is on it. The look half's buttons are padded to sit above the row, so reaching for a slot cannot turn the camera.
   - The **Look speed** slider above the buttons sets how far the view turns per pixel of finger travel: `1.0` follows your finger exactly, the default `0.45` is slower because Minecraft applies its own mouse sensitivity on top. The value is remembered per browser, so tune it on the device you play on. Because turning follows your finger at a steady rate instead of accelerating the longer you hold it, a value you tuned on an older build may feel slow — raise the slider a notch.
 - **⛶** toggles fullscreen. The toolbar and overlay respect phone safe areas.
 - The desktop defaults to 1024×640 with 120 DPI fonts and a 24 px cursor for touch targets; override with `SCREEN_WIDTH` / `SCREEN_HEIGHT`. Window compositing is off because rendering is CPU-based.
 
+## Desktop modes and what they cost
+
+The desktop is not the point of this image — the game is — so the default session is deliberately small:
+
+| Session | Runs | Approx. idle RSS |
+| --- | --- | --- |
+| `SESSION=lite` (default) | Xvfb, dbus, openbox, Prism Launcher | ~300 MB including the launcher |
+| `SESSION=xfce` | the above plus xfce4-session, xfwm4, xfdesktop, xfce4-panel, xfsettingsd, xfconfd and Thunar's daemon | ~550 MB |
+
+In lite mode the desktop background is empty and there is no taskbar: right-click it for a small menu with Prism Launcher, Terminal and Files. Window management, focus, titlebars, minimise and fullscreen toggle (F11 / a double-click on the titlebar) all still work.
+
+Environment variables that control the cost of the desktop and the streamer:
+
+- `SESSION=lite|xfce` — which desktop to run (default `lite`).
+- `AUTOSTART_PRISM=0` — do not start the launcher with the session.
+- `FIT_GAME_WINDOW=0` — stop forcing Minecraft's window to the full screen geometry (see the mouse-look notes below; only turn this off if you move the game into a window on purpose).
+- `VNC_WAIT` and `VNC_DEFER` (default `8` and `12`, milliseconds) — how often x11vnc polls the framebuffer and how long it batches damage before encoding. Higher values cost a few milliseconds of stream latency and save CPU; `VNC_WAIT=5 VNC_DEFER=5` is the twitchier old setting.
+- `MALLOC_ARENA_MAX` (default `2`) — caps glibc's per-thread allocation arenas. Java, Mesa and GTK all allocate from many threads and the default is one arena per core, which costs RSS and page faults for nothing here.
+- `LP_NUM_THREADS` — llvmpipe's worker count, already derived from the container's CPU quota.
+
 ## Resource recommendations for a 6 GB / 150% CPU team pool
 
 - Give CloudPC about 4 GB RAM and 125% CPU only if the rest of your team has enough left.
-- Keep Java maximum memory around 1–1.5 GB initially. Raising it does not make the CPU or GPU faster.
+- Java heap: 2.5 GiB is what the instance ships with and 3 GiB is a comfortable ceiling for this scene; a 4 GiB maximum is fine but is headroom, not speed. The heap does not make frames faster — it only avoids collection stalls and running out of memory while chunks generate — and a heap that is allowed to grow to 4 GiB can press the whole container against its 6 GB limit, where the out-of-memory killer usually takes the game or the X server. If the app restarts by itself while you play, lower it first.
 - Start with 2–4 chunks render distance, low graphics, no shaders and a small modpack.
 - Close other desktop applications while Minecraft is running.
 - The container's virtual display uses software rendering. `glxinfo -B` can help identify the renderer; if it reports llvmpipe, rendering is CPU-based.
@@ -98,7 +118,7 @@ What CloudPC already does for you:
 - The seeded instance runs fullscreen, with a 2.5 GiB heap because 1.21.x plus mods thrashes a 1.5 GiB heap. Fullscreen is the one size the touch look can work with: Minecraft pins the hidden cursor to the middle of its window and reads the mouse as the offset from there, and the look pad injects "middle of the screen plus this drag's travel". Only fullscreen makes those two middles the same pixel. If you switch fullscreen off with F11, the game falls back to the 960×540 window in `instance.cfg`.
 - A fresh instance starts at render distance 3, simulation distance 4, fast graphics, smooth lighting off, no clouds, no entity shadows, minimal particles and vsync off.
 - The image ships pinned **performance mods** for exactly that Minecraft and NeoForge, every jar checksummed at build time and copied into any compatible instance on boot: **RenderScale** 1.3.6 (plus the Cloth Config it needs) preset to `scale: 0.33`, so the world is drawn at a third of the window resolution and upscaled — about a ninth of the pixels, HUD still sharp; **Sodium** 0.8.15, which replaces the chunk renderer and issues far fewer GL calls per frame; **Lithium** 0.21.4 for cheaper entity, AI and collision ticking; **ImmediatelyFast** 1.14.3 for batched HUD, text and entity drawing; **EntityCulling** 1.12.2 to skip entities that terrain hides anyway; and **BadOptimizations** 2.4.1 for assorted micro-optimisations. RenderScale's author documents it as compatible with Sodium. Jars only go to instances that are NeoForge 1.21.11 with NeoForge 21.11.6 or newer (the builds are pinned to that, and a mismatched loader mod stops Minecraft from starting), and never to an instance that already has its own build of that mod. Change the scale in game under **Mods → RenderScale → Config → Scale factor** (0.25 goes further, 0.5 is sharper); a factor CloudPC did not write is never overwritten. Set `MODS=0` (or the older `RENDERSCALE=0`) in the app environment to ship an untouched instance.
-- Minecraft is switched to fullscreen on start. A windowed game is cheaper for a CPU rasteriser, but it breaks touch look: the game pins the hidden cursor to the middle of its window while the look pad injects around the middle of the screen, so any gap between the two is added to every single update and the camera slides the same way whatever direction you drag. Fullscreen makes the gap zero. Fullscreen also survives F11: CloudPC flips the setting once, so switching it off yourself is respected.
+- Minecraft is switched to fullscreen on start, and on top of that the container re-fits every Minecraft window it sees to the whole screen at 0,0 with decorations off. Relying on the game's own fullscreen request alone was not enough here: GLFW picks an XRandR video mode, which Xvfb offers few of, and the window manager can still add a titlebar afterwards — and a titlebar's worth of offset is exactly what made the camera walk one direction whatever way you dragged. A windowed game is cheaper for a CPU rasteriser, but it breaks touch look: the game pins the hidden cursor to the middle of its window while the look pad injects around the middle of the screen, so any gap between the two is added to every single update and the camera slides the same way whatever direction you drag. Fullscreen makes the gap zero. Fullscreen also survives F11: CloudPC flips the setting once, so switching it off yourself is respected.
 - If you would rather have the cheaper windowed game, set `fullscreen:false` in `<instance>/options.txt`. The overlay's drag-look (🎮) needs the two middles to line up, so in that case look with the **trackpad** (🖱): it drives the cursor's absolute position, so a windowed game still turns predictably.
 
 ### What the browser does, and what it cannot do
@@ -132,7 +152,7 @@ Run `glxinfo -B` in a desktop terminal to confirm the renderer: when it reports 
 
 ### Stale halves or torn pictures
 
-If parts of the picture stop updating — a stale half of a window, or a torn frame while the game redraws — x11vnc is polling the framebuffer instead of using the XDAMAGE extension. Polling re-reads the whole 1024×640 screen every pass, which on ~1 CPU catches only part of each redraw and competes with Minecraft for CPU. CloudPC uses XDAMAGE by default, so only the rectangles that actually changed are read and sent, and updates leave within 5 ms (`-wait 5 -defer 5`). If some GL application ever stops updating the picture under XDAMAGE, set the app environment variable `VNC_NO_DAMAGE=1` to return to full-screen polling.
+If parts of the picture stop updating — a stale half of a window, or a torn frame while the game redraws — x11vnc is polling the framebuffer instead of using the XDAMAGE extension. Polling re-reads the whole 1024×640 screen every pass, which on ~1 CPU catches only part of each redraw and competes with Minecraft for CPU. CloudPC uses XDAMAGE by default, so only the rectangles that actually changed are read and sent, and updates leave within about 12 ms (`-wait 8 -defer 12`). If some GL application ever stops updating the picture under XDAMAGE, set the app environment variable `VNC_NO_DAMAGE=1` to return to full-screen polling.
 
 This does not turn the container into a gaming host. Real frame rates need GPU passthrough or an ordinary machine.
 

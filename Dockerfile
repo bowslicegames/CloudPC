@@ -22,6 +22,7 @@ RUN printf '%s\n' \
  && apt-get install -y --no-install-recommends \
       ca-certificates curl wget gnupg \
       xvfb x11vnc novnc websockify x11-utils \
+      openbox xdotool \
       xfce4-session xfce4-panel xfce4-terminal xfdesktop4 xfwm4 \
       thunar mousepad dbus dbus-x11 \
       fonts-dejavu fonts-liberation \
