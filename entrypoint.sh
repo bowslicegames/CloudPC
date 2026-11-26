@@ -118,6 +118,42 @@ fi
 
 CPU_BUDGET="$(cgroup_cpu_limit)"
 
+# The heap is the only thing here large enough to be the difference between a tight
+# container and an OOM kill, and the size it should be is not a property of this
+# image: the allocation changed under it when Altare's free tier went from 6 GiB to
+# 4 GiB. So the heap follows the cgroup limit instead of a fixed number. A 2.5 GiB
+# heap on a 4 GiB box leaves nothing for the page cache that keeps a modded world
+# from re-reading its jars, and the OOM killer picks the JVM. 55% of the limit in
+# 256 MiB steps, never below 1 GiB (1.21.x with mods will not finish loading) and
+# never above 3 GiB (nothing on one core uses the rest).
+cgroup_memory_limit_mib() {
+  local bytes="" name
+  for name in /sys/fs/cgroup/memory.max /sys/fs/cgroup/memory/memory.limit_in_bytes; do
+    [[ -r "$name" ]] || continue
+    read -r bytes < "$name" || true
+    [[ "$bytes" =~ ^[0-9]+$ ]] || continue
+    # cgroup v1 reports a page-aligned near-2^63 when there is no limit at all.
+    (( bytes > 1099511627776 )) && continue
+    echo $(( bytes / 1048576 ))
+    return 0
+  done
+  return 1
+}
+MEMORY_BUDGET_MIB=""
+MINECRAFT_HEAP_MIB=""
+if MEMORY_BUDGET_MIB="$(cgroup_memory_limit_mib)"; then
+  # The full session costs more than the launcher alone: XFCE brings several hundred
+  # megabytes of daemons, so it gets a smaller slice of the same box.
+  HEAP_SHARE=55
+  if [[ "${SESSION:-lite}" != "lite" ]]; then HEAP_SHARE=50; fi
+  MINECRAFT_HEAP_MIB=$(( MEMORY_BUDGET_MIB * HEAP_SHARE / 100 ))
+  MINECRAFT_HEAP_MIB=$(( (MINECRAFT_HEAP_MIB + 128) / 256 * 256 ))
+  if (( MINECRAFT_HEAP_MIB < 1024 )); then MINECRAFT_HEAP_MIB=1024; fi
+  if (( MINECRAFT_HEAP_MIB > 3072 )); then MINECRAFT_HEAP_MIB=3072; fi
+else
+  MEMORY_BUDGET_MIB=""
+fi
+
 # ---------------------------------------------------------------------------
 # The stream is a rectangle
 #
@@ -257,9 +293,38 @@ set_instance_default() {
     echo "CloudPC: instance default ${key} ${from} -> ${to}"
   fi
 }
-# 1.21.x with mods needs more heap than 1.5 GiB.
-set_instance_default MinMemAlloc 512 1024
-set_instance_default MaxMemAlloc 1536 2560
+# 1.21.x with mods needs more heap than 1.5 GiB. The value is the one derived from the
+# container's memory limit above; only a number an earlier build of this image wrote
+# is moved forward, so a value typed into Prism is still the user's.
+apply_instance_mem() {
+  local key="$1" value="$2" cfg="$3" current
+  [[ -f "$cfg" ]] || return 1
+  current="$(sed -n "s/^${key}=//p" "$cfg" | tail -n 1)"
+  if [[ "$current" == "$value" ]]; then return 1; fi
+  case "$current" in
+    ""|512|1024|1536|2560) ;;
+    *) return 1 ;;
+  esac
+  if grep -q "^${key}=" "$cfg"; then
+    sed -i "s|^${key}=.*\$|${key}=${value}|" "$cfg"
+  else
+    printf '%s=%s\n' "$key" "$value" >> "$cfg"
+  fi
+  return 0
+}
+if [[ -n "$MINECRAFT_HEAP_MIB" ]]; then
+  if apply_instance_mem MaxMemAlloc "$MINECRAFT_HEAP_MIB" "$INSTANCE_CFG"; then
+    echo "CloudPC: Minecraft heap ${MINECRAFT_HEAP_MIB} MiB, sized from ${MEMORY_BUDGET_MIB} MiB allowed."
+  fi
+  # Initial heap equal to the maximum: growing a heap is a series of full collections
+  # and page faults in the middle of play, and the allocation is not going to move.
+  if apply_instance_mem MinMemAlloc "$MINECRAFT_HEAP_MIB" "$INSTANCE_CFG"; then
+    echo "CloudPC: Minecraft initial heap matched at ${MINECRAFT_HEAP_MIB} MiB."
+  fi
+else
+  set_instance_default MinMemAlloc 512 1024
+  set_instance_default MaxMemAlloc 1536 2560
+fi
 # The desktop is 800x500: every pixel is shaded on the CPU and then encoded for
 # the browser, which upscales the stream to the device. That is 61% of the pixels of
 # the old 1024x640 desktop, at the same 16:10 shape, so nothing has to be re-laid-out.
@@ -598,7 +663,7 @@ fi
 # desktop can be diagnosed from the log instead of guessed at. nproc is what the
 # host reports, which is why llvmpipe needs the cgroup quota instead of it.
 read -r STREAM_WIDTH STREAM_HEIGHT < <(stream_size)
-echo "CloudPC: performance -- ${CPU_BUDGET} CPU core(s) allowed (nproc $(nproc)), llvmpipe ${LP_NUM_THREADS} thread(s), framebuffer ${SCREEN_WIDTH}x${SCREEN_HEIGHT} (PIXEL_OFFLOAD=${PIXEL_OFFLOAD:-0}, UI scale ${UI_SCALE}), stream ${STREAM_WIDTH}x${STREAM_HEIGHT} at $(stream_scale)% of it, ${VNC_WAIT}/${VNC_DEFER} ms, Minecraft on Serial GC with ${JAVA_CPUS} core(s), view $(sed -n 's/^renderDistance://p' "$INSTANCE_OPTIONS" 2>/dev/null | head -n1)/sim $(sed -n 's/^simulationDistance://p' "$INSTANCE_OPTIONS" 2>/dev/null | head -n1)."
+echo "CloudPC: performance -- ${CPU_BUDGET} CPU core(s) allowed (nproc $(nproc)), llvmpipe ${LP_NUM_THREADS} thread(s), framebuffer ${SCREEN_WIDTH}x${SCREEN_HEIGHT} (PIXEL_OFFLOAD=${PIXEL_OFFLOAD:-0}, UI scale ${UI_SCALE}), stream ${STREAM_WIDTH}x${STREAM_HEIGHT} at $(stream_scale)% of it, ${VNC_WAIT}/${VNC_DEFER} ms, Minecraft on Serial GC with ${JAVA_CPUS} core(s) and a ${MINECRAFT_HEAP_MIB:-preset} MiB heap of ${MEMORY_BUDGET_MIB:-unknown} MiB allowed, view $(sed -n 's/^renderDistance://p' "$INSTANCE_OPTIONS" 2>/dev/null | head -n1)/sim $(sed -n 's/^simulationDistance://p' "$INSTANCE_OPTIONS" 2>/dev/null | head -n1)."
 case "$GL_RENDERER_LINE" in
   *softpipe*)
     echo "WARNING: Mesa is on softpipe, which is several times slower than llvmpipe. Check that libgl1-mesa-dri is installed; GALLIUM_DRIVER=llvmpipe forces the fast rasteriser."
