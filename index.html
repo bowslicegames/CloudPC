@@ -163,7 +163,7 @@ button[aria-pressed="true"],button.primary{background:var(--accent);color:var(--
 <header id="toolbar">
   <strong>CloudPC</strong>
   <span id="status">Connecting to desktop…</span>
-  <span id="fps" title="The game's frames per second while it runs, capped by the updates the stream delivers. A still picture sends no updates, which is not a slow game.">-- fps</span>
+  <span id="fps" title="The game's frames per second while it runs, capped by the updates the stream delivers. A still picture sends no updates, which is not a slow game.">idle</span>
   <div class="buttons">
     <button id="keyboardBtn" type="button" title="On-screen keyboard" aria-label="On-screen keyboard">⌨</button>
     <button id="trackpadBtn" type="button" title="Trackpad (touch pointer)" aria-label="Trackpad" aria-pressed="false">🖱</button>
@@ -1069,27 +1069,59 @@ function reapplyStreamModeWhenSized(connection) {
 
 /* Count the stream's updates, not the canvas's draw calls.
  *
- * noVNC paints one update as one or more rectangles, so counting drawImage and
- * putImageData counted pieces of frames — a screen where only the HUD moved reported
- * a fraction of a frame. RFB fires exactly one "framebufferupdate" per update, and it
- * only fires when pixels changed: that is why a still picture read zero, and why zero
- * was never a measurement of the game's speed. The container measures the game's own
- * frames separately (fpswatch.py, from the damage the game's window receives) and
- * reports them with the stream state. The stream rate stays as the fallback and as the
- * ceiling, because a game at 30 fps whose picture arrives at 12 is a 12 fps view. */
+ * An update is one FramebufferUpdate message, and noVNC has no event for it: the
+ * events it dispatches are connect, disconnect, clipboard, desktopname and a few
+ * errors. Counting the canvas's drawImage/putImageData calls instead counts one or
+ * more pieces of an update, and hooking an event name that does not exist counts
+ * nothing at all — which is why this read "—" forever. noVNC does call exactly one
+ * method per FramebufferUpdate, so that is what is wrapped here; the canvas methods
+ * are kept only as a fallback for a noVNC whose internals moved, and they are
+ * collapsed per task so several rectangles still count as one update.
+ *
+ * An update only arrives when pixels changed: that is why a still picture reads zero,
+ * and why zero was never a measurement of the game's speed. The container measures
+ * the game's own frames separately (fpswatch.py, from the damage the game's window
+ * receives) and reports them with the stream state. The stream rate stays as the
+ * fallback and the ceiling, because a game at 30 fps whose picture arrives at 12 is a
+ * 12 fps view. */
 let streamFrames = 0;
 let streamFps = 0;
 let streamSeen = 0;
 let gameFps = null;
+let fpsWhy = null;
 let fpsLast = 0;
 
 function hookStreamCounter(connection) {
   if (!connection || connection.cloudpcCounted) return;
-  connection.cloudpcCounted = true;
-  connection.addEventListener("framebufferupdate", () => {
+  let counted = false;
+  const note = () => {
+    if (counted) return;
+    counted = true;
     streamFrames += 1;
     streamSeen = performance.now();
-  });
+    queueMicrotask(() => { counted = false; });
+  };
+  const perUpdate = connection._framebufferUpdate;
+  if (typeof perUpdate === "function") {
+    connection.cloudpcCounted = true;
+    connection._framebufferUpdate = function (...args) {
+      note();
+      return perUpdate.apply(this, args);
+    };
+    return;
+  }
+  const display = connection._display;
+  const context = display && display._drawCtx;
+  if (!context) return;
+  connection.cloudpcCounted = true;
+  for (const name of ["putImageData", "drawImage", "fillRect"]) {
+    const original = context[name];
+    if (typeof original !== "function") continue;
+    context[name] = function (...args) {
+      note();
+      return original.apply(this, args);
+    };
+  }
 }
 
 /* Two numbers matter and they are not the same one: the frames the game draws, and the
@@ -1112,11 +1144,14 @@ function visibleFps() {
 function paintFps() {
   if (!fpsEl) return;
   const value = visibleFps();
-  if (value === null) {
-    fpsEl.textContent = streamSeen ? "still" : "-- fps";
-    return;
-  }
-  fpsEl.textContent = Math.round(value) + " fps";
+  fpsEl.textContent = value === null
+    ? (streamSeen ? "still" : "idle")
+    : Math.round(value) + " fps";
+  fpsEl.title = fpsWhy
+    ? "The game's own frame rate is not available (" + fpsWhy + "), so this is the " +
+      "stream's updates per second. A still picture sends none, which is not a slow game."
+    : "The game's frames per second, capped by the updates the stream delivers while " +
+      "the picture moves. A still picture sends no updates, which is not a slow game.";
 }
 
 setInterval(() => {
@@ -1157,8 +1192,8 @@ streamBtn.addEventListener("click", () => {
  * the picture is as large as this container can actually keep up with.
  */
 const DETAIL_KEY = "cloudpc.detail";
-const DETAIL_LEVELS = [100, 80, 62, 50, 40];
-const DETAIL_NAMES = ["Full", "Large", "Medium", "Small", "Tiny"];
+const DETAIL_LEVELS = [100, 80, 62, 50, 40, 30];
+const DETAIL_NAMES = ["Full", "Large", "Medium", "Small", "Tiny", "Minimal"];
 const DETAIL_TARGET = 20;
 let detailAuto = true;
 let detailIndex = 1;
@@ -1244,6 +1279,25 @@ detailBtn?.addEventListener("click", () => {
   detailFast = 0;
 });
 
+/* What Auto is allowed to act on.
+ *
+ * The game's own rate is the honest signal and the one this prefers: it counts
+ * presented frames, so a still camera reports thirty rather than zero.
+ *
+ * The stream rate is only a fallback, and only while the picture is actually moving.
+ * That is the distinction that matters: a still picture sends no updates, which is
+ * not a slow game, and shrinking the screen because nothing moved would be a guess
+ * with nothing to correct it. Below a handful of updates a second the number says
+ * nothing about the game, so Auto holds its setting instead. */
+const GOVERN_STREAM = 8;
+function governingRate() {
+  if (Number.isFinite(gameFps) && gameFps >= 1) return gameFps;
+  if (streamFps >= GOVERN_STREAM && performance.now() - streamSeen < 1500) {
+    return streamFps;
+  }
+  return null;
+}
+
 function governFps() {
   const now = performance.now();
   if (!detailAuto || !gameRunning) {
@@ -1254,9 +1308,7 @@ function governFps() {
   /* Let the last change settle: the game re-creates its framebuffer and the stream
    * re-sends a whole screen, and judging either while it happens is wrong. */
   if (now - detailChanged < 7000) return;
-  const fps = visibleFps();
-  /* Nothing measured: the game reports no frames and nothing has been drawn. That is
-   * a stream with nothing to send, not a slow one, and shrinking would be a guess. */
+  const fps = governingRate();
   if (fps === null) {
     detailSlow = 0;
     detailFast = 0;
@@ -1265,7 +1317,7 @@ function governFps() {
   if (fps < DETAIL_TARGET * 0.85) {
     detailSlow += 1;
     detailFast = 0;
-  } else if (fps >= DETAIL_TARGET * 1.4 && streamFps >= 12) {
+  } else if (fps >= DETAIL_TARGET * 1.4 && streamFps >= 10) {
     /* Spend detail again only on a picture the stream can actually carry: a paused
      * or loading game draws quickly, and a stream that is only delivering a dozen
      * updates would spend the detail and hand it straight back. */
@@ -1293,6 +1345,7 @@ async function pollStream() {
       const state = await response.json();
       gameRunning = !!state.game;
       gameFps = Number.isFinite(state.fps) ? state.fps : null;
+      fpsWhy = gameFps === null ? (state.fpsWhy || null) : null;
       if (!detailSynced) {
         detailSynced = true;
         if (detailAuto && state.scale) {
@@ -1304,6 +1357,7 @@ async function pollStream() {
   } catch {
     gameRunning = false;
     gameFps = null;
+    fpsWhy = "the desktop is not answering";
   }
   setTimeout(pollStream, 1000);
 }
@@ -1677,6 +1731,10 @@ function connect() {
   }
   canvas = null;
   cursor = null;
+  streamFrames = 0;
+  streamFps = 0;
+  streamSeen = 0;
+  fpsLast = 0;
   passwordPrompt.hidden = true;
   screenEl.replaceChildren();
   reconnectBtn.style.display = "none";

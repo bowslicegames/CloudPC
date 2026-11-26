@@ -12,14 +12,20 @@ write as damage whether or not one pixel of it differs. Watching the window's da
 therefore counts presented frames, still camera or not, and it is the number a player
 means by fps.
 
-The result is published as a whole number in FPS_FILE and the file is removed when no
-game window is up. This runs as its own process on purpose: a fault here can cost the
-reading and nothing else — the desktop, the stream and the input path never wait on
-it, and a stale file is ignored by the reader.
+Two files are published. FPS_FILE holds the whole number, and is removed when no game
+window is up. FPS_FILE.status holds the same reading with the reason behind it — no
+window, no DAMAGE extension, no X connection — so the page can say why it has no
+number instead of showing a dash with no explanation. The reading is written every
+second for as long as this process lives: a branch that published nothing left a stale
+file behind and the page read that as "no measurement at all".
+
+This runs as its own process on purpose: a fault here can cost the reading and nothing
+else — the desktop, the stream and the input path never wait on it.
 """
 
 import ctypes
 import ctypes.util
+import json
 import os
 import select
 import subprocess
@@ -29,14 +35,21 @@ from collections import deque
 
 DISPLAY = os.environ.get("CLOUDPC_DISPLAY", ":0")
 FPS_FILE = os.environ.get("CLOUDPC_FPS_FILE", "/tmp/cloudpc-fps")
+STATUS_FILE = os.environ.get("CLOUDPC_FPS_STATUS", FPS_FILE + ".status")
 GAME_TITLE = os.environ.get("CLOUDPC_GAME_TITLE", "^Minecraft")
 
-# A presented frame's damage covers the window; a HUD redraw, a tooltip or a cursor
-# alone is a sliver of it. Only the former counts as a frame.
-FRAME_AREA = 0.35
-MIN_FRAME_AREA = 4096
-# One frame can arrive as two damaged rectangles; anything closer than this to the last
-# counted one is part of the same frame. A 30 fps game presents every 33 ms.
+# A presented frame writes the window: Minecraft clears it and draws the world into
+# it, so one frame's damage covers all of it. A HUD redraw, a tooltip or a cursor
+# alone is a sliver, and counting those would report frames where nothing happened.
+# The share is deliberately small: some drivers only report the rectangle that really
+# changed, and a frame that is mostly identical would then look like a sliver too.
+FRAME_AREA = 0.02
+MIN_FRAME_AREA = 2048
+# If a window's damage never reaches that share, count every damage on it instead of
+# giving up on the reading.
+LOOSE_AFTER = 4.0
+# One frame can arrive as more than one damaged rectangle; anything closer than this
+# to the last counted one belongs to the same frame. A 30 fps game presents every 33 ms.
 FRAME_GAP = 0.004
 WINDOW_POLL = 2.0
 RATE_WINDOW = 2.0
@@ -85,9 +98,15 @@ def game_window():
         return None
 
 
-def publish(value):
-    """Write the reading, or remove it when there is nothing to report. Replaced
-    rather than overwritten so the reader never sees half a number."""
+def publish(value, status):
+    """Write the reading and the reason behind it. Replaced rather than overwritten so
+    a reader never sees half a number, and removed when there is nothing to report."""
+    try:
+        with open(STATUS_FILE + ".tmp", "w", encoding="utf-8") as handle:
+            json.dump(status, handle)
+        os.replace(STATUS_FILE + ".tmp", STATUS_FILE)
+    except OSError:
+        pass
     if value is None:
         try:
             os.unlink(FPS_FILE)
@@ -119,6 +138,10 @@ def watch():
     xdamage.XDamageCreate.restype = ctypes.c_ulong
     xdamage.XDamageCreate.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.c_int]
     xdamage.XDamageDestroy.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
+    # A damage object accumulates until it is subtracted; left alone the region grows
+    # until it is the whole window and costs the server work on every frame.
+    xdamage.XDamageSubtract.argtypes = [
+        ctypes.c_void_p, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_ulong]
 
     # A window can disappear between xdotool naming it and damage being created on it,
     # and Xlib's default error handler calls exit() for a bad drawable. The game
@@ -145,6 +168,10 @@ def watch():
     next_poll = 0.0
     next_publish = 0.0
     last_count = 0.0
+    created = 0.0
+    events = frames = 0
+    biggest = (0, 0)
+    loose = False
 
     while True:
         now = time.monotonic()
@@ -157,7 +184,11 @@ def watch():
                     xdamage.XDamageDestroy(display, damage)
                 damage = 0
                 window = None
+                width = height = 0
                 stamps.clear()
+                events = frames = 0
+                biggest = (0, 0)
+                loose = False
             elif found["id"] != window:
                 if damage:
                     xdamage.XDamageDestroy(display, damage)
@@ -166,7 +197,12 @@ def watch():
                 damage = xdamage.XDamageCreate(display, window, 0)
                 x11.XSync(display, 0)
                 stamps.clear()
+                events = frames = 0
+                biggest = (0, 0)
+                loose = False
+                created = time.monotonic()
                 if not damage:
+                    print("CloudPC: window %s takes no damage watch" % window, flush=True)
                     window = None
 
         while x11.XPending(display):
@@ -174,25 +210,55 @@ def watch():
             item = DamageNotify.from_buffer(event)
             if item.type != notify or item.damage != damage:
                 continue
+            events += 1
             area = item.area.width * item.area.height
-            if area < max(MIN_FRAME_AREA, FRAME_AREA * width * height):
+            if area > biggest[0] * biggest[1]:
+                biggest = (item.area.width, item.area.height)
+            if area < (1 if loose else max(MIN_FRAME_AREA, FRAME_AREA * width * height)):
                 continue
             if now - last_count < FRAME_GAP:
                 continue
             last_count = now
             stamps.append(now)
+            frames += 1
+            if frames == 1:
+                print("CloudPC: game frame %dx%d on a %dx%d window"
+                      % (item.area.width, item.area.height, width, height), flush=True)
+
+        if damage and not loose and events and not frames and now - created >= LOOSE_AFTER:
+            loose = True
+            print("CloudPC: no damage on the game window covers a frame (largest %dx%d of "
+                  "%dx%d); counting every damage instead"
+                  % (biggest[0], biggest[1], width, height), flush=True)
+
+        if damage:
+            xdamage.XDamageSubtract(display, damage, 0, 0)
 
         if time.monotonic() >= next_publish:
-            next_publish = time.monotonic() + 1.0
-            cutoff = next_publish - RATE_WINDOW
+            after = time.monotonic()
+            next_publish = after + 1.0
+            cutoff = after - RATE_WINDOW
             while stamps and stamps[0] < cutoff:
                 stamps.popleft()
-            if window is None:
-                publish(None)
-            elif len(stamps) >= 2 and stamps[-1] - stamps[0] >= 0.4:
-                publish(round((len(stamps) - 1) / (stamps[-1] - stamps[0])))
-            elif not stamps:
-                publish(0)
+            rate = 0
+            if window is not None:
+                if len(stamps) >= 2 and stamps[-1] - stamps[0] >= 0.5:
+                    rate = round((len(stamps) - 1) / (stamps[-1] - stamps[0]))
+                else:
+                    rate = round(len(stamps) / RATE_WINDOW)
+            why = "" if window is not None else "no game window"
+            if window is not None and not rate:
+                why = "the game window is not being drawn into"
+            publish(None if window is None else rate, {
+                "up": window is not None,
+                "fps": None if window is None else rate,
+                "why": why,
+                "window": [width, height],
+                "events": events,
+                "frames": frames,
+                "biggest": [biggest[0], biggest[1]],
+                "loose": loose,
+            })
 
         wait = min(0.25, max(0.0, min(next_poll, next_publish) - time.monotonic()))
         try:
@@ -207,6 +273,7 @@ def main():
         reason = watch()
     except OSError as error:
         reason = "X libraries or the display are unavailable: %s" % error
+    publish(None, {"up": False, "fps": None, "why": reason})
     print("CloudPC: frame counter stopped: %s" % reason, flush=True)
     return 1
 

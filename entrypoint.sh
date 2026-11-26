@@ -95,11 +95,23 @@ export LP_NUM_THREADS MESA_SHADER_CACHE_DIR MESA_SHADER_CACHE_MAX_SIZE
 # vsync off), and leave Mesa's shader cache alone so the LLVM JIT does not rebuild
 # programs it has already compiled.
 export vblank_mode=0 MESA_SHADER_CACHE_DISABLE=false
-# Mesa's threaded GL dispatch moves the OpenGL command stream onto a second thread;
-# that is how Minecraft got its ~30% improvement on Mesa drivers. It only pays while
-# a core is free, so it is opt-in for this container: GLTHREAD=1 in the app
-# environment turns it on.
-if [[ "${GLTHREAD:-0}" == "1" ]]; then
+# Name the fast software rasteriser instead of letting Mesa choose: when it cannot
+# prove the pixels are aligned it falls back to softpipe, which is several times
+# slower, and "the desktop is suddenly unusable" would then have no visible cause.
+# With a render node present the real driver is left alone.
+if [[ ! -e /dev/dri/renderD128 && ! -e /dev/dri/card0 && -z "${GALLIUM_DRIVER:-}" ]]; then
+  export GALLIUM_DRIVER=llvmpipe
+fi
+# Mesa's threaded GL dispatch moves the OpenGL command stream onto a second thread,
+# which is where Minecraft's ~30% on Mesa drivers comes from. It needs a second core
+# to land on: on one core the extra thread only adds hand-offs, so it is on by default
+# where the cgroup allows two, off below that. GLTHREAD=1 forces it on and GLTHREAD=0
+# forces it off.
+GLTHREAD="${GLTHREAD:-auto}"
+if [[ "$GLTHREAD" == "auto" ]]; then
+  if (( LP_NUM_THREADS >= 2 )); then GLTHREAD=1; else GLTHREAD=0; fi
+fi
+if [[ "$GLTHREAD" == "1" ]]; then
   export mesa_glthread=true
   echo "CloudPC: Mesa threaded GL dispatch on (GLTHREAD=1)."
 fi
@@ -130,12 +142,17 @@ STREAM_FILE="${STREAM_FILE:-/data/.config/cloudpc-stream}"
 # page reads it from mouseproxy, and nothing waits on the process that writes it.
 FPS_FILE="${FPS_FILE:-/tmp/cloudpc-fps}"
 
-# A container with one and a bit cores cannot afford to start at full size. Start
-# one step down there; a desktop with cores to spare starts at the whole screen.
+# A container with one and a bit cores cannot afford to start at full size, and it is
+# the worst place to start: every stage after the game draws runs on that same core,
+# so the first seconds ask for the most pixels per frame the session will ever ask
+# for. Start two steps down there, one step down at two cores, full size with cores
+# to spare. Auto moves it either way; this only decides where it starts.
 if (( CPU_BUDGET >= 3 )); then
   DEFAULT_STREAM_SCALE=100
-else
+elif (( CPU_BUDGET >= 2 )); then
   DEFAULT_STREAM_SCALE=80
+else
+  DEFAULT_STREAM_SCALE=62
 fi
 
 stream_scale() {
@@ -147,7 +164,7 @@ stream_scale() {
   if [[ ! "$percent" =~ ^[0-9]+$ ]]; then
     percent="$DEFAULT_STREAM_SCALE"
   fi
-  if (( percent < 40 )); then percent=40; fi
+  if (( percent < 30 )); then percent=30; fi
   if (( percent > 100 )); then percent=100; fi
   echo "$percent"
 }
@@ -325,6 +342,11 @@ set_options_default simulationDistance 4 3
 # picture can show. An uncapped menu, sky or paused game is the cheapest place to
 # hand a core back to the encoder and to everything else on the box.
 set_options_default maxFps 60 30
+# The HUD is laid out in "GUI pixels" and the scale is pinned here, so a fixed 2 at a
+# 240x150 stream draws a hotbar wider than the window. 0 is Minecraft's Auto, which
+# picks the largest scale that fits: 2 at full size, 1 once the Detail control has
+# shrunk the window below 640x480, and back up when it grows.
+set_options_default guiScale 2 0
 
 # Options that only add per-frame work and that an older options.txt does not
 # contain at all. Each is written once and then belongs to the game: a key that is
@@ -979,7 +1001,7 @@ fi
 # websockify only has to carry the RFB socket now; noVNC's files and the mouse
 # endpoint are served by mouseproxy.py on the exposed port, in front of it.
 echo "CloudPC: starting websockify on 127.0.0.1:${WS_PORT}..."
-websockify "127.0.0.1:${WS_PORT}" "127.0.0.1:${VNC_PORT}" &
+nice -n 19 websockify "127.0.0.1:${WS_PORT}" "127.0.0.1:${VNC_PORT}" &
 WS_PID=$!
 
 WS_READY=0

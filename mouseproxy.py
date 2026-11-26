@@ -59,7 +59,7 @@ MAX_BODY = 4096
 SCREEN_WIDTH = int(os.environ.get("CLOUDPC_SCREEN_WIDTH", "800"))
 SCREEN_HEIGHT = int(os.environ.get("CLOUDPC_SCREEN_HEIGHT", "500"))
 STREAM_FILE = os.environ.get("CLOUDPC_STREAM_FILE", "/data/.config/cloudpc-stream")
-MIN_SCALE = 40
+MIN_SCALE = 30
 MAX_SCALE = 100
 # Every child process talks to the same X display as the pointer injection.
 CHILD_ENV = dict(os.environ, DISPLAY=DISPLAY, HOME=os.environ.get("HOME", "/home/cloud"))
@@ -119,20 +119,28 @@ def current_window():
         return WINDOW["value"]
 
 
-def game_fps():
-    """The game's own frame rate, as fpswatch.py last measured it.
+def fps_state():
+    """The game's own frame rate, and the reason when there is none.
 
-    None when no game is up or the reading has stopped moving, so the page can fall
-    back to its own stream counter instead of showing a number that froze. The file
-    is written by a separate process for exactly this reason.
+    fpswatch.py writes one number a second while a game window is up and removes the
+    file when none is, so a fresh number is also the proof that the game is up: it
+    cannot exist unless something is watching a window that takes damage. That keeps
+    the page working when xdotool fails to name the window for a moment.
+
+    When there is no number, the counter's side file says why — no window, no DAMAGE
+    extension, no X at all — so the page can show the reason instead of a dash.
     """
     try:
-        if time.time() - os.path.getmtime(FPS_FILE) > 4:
-            return None
-        with open(FPS_FILE, encoding="utf-8") as handle:
-            return int(handle.read().strip())
+        if time.time() - os.path.getmtime(FPS_FILE) <= 4:
+            with open(FPS_FILE, encoding="utf-8") as handle:
+                return int(handle.read().strip()), ""
     except (OSError, ValueError):
-        return None
+        pass
+    try:
+        with open(FPS_FILE + ".status", encoding="utf-8") as handle:
+            return None, str(json.load(handle).get("why") or "the counter is not reporting")
+    except (OSError, ValueError, AttributeError):
+        return None, "the frame counter is not running"
 
 
 def game_window():
@@ -177,9 +185,11 @@ def stream_state():
     percent = stream_scale()
     width, height = stream_size(percent or MAX_SCALE)
     window = current_window()
+    fps, why = fps_state()
     return {"scale": percent, "width": width, "height": height,
             "screen": [SCREEN_WIDTH, SCREEN_HEIGHT],
-            "game": window is not None, "fps": game_fps() if window else None}
+            "game": window is not None or fps is not None,
+            "fps": fps, "fpsWhy": why or None}
 
 
 class Pointer:
@@ -505,9 +515,8 @@ class Handler(BaseHTTPRequestHandler):
             # No game to send: choosing a level is remembered for the next one, and
             # the desktop goes back to the whole screen it was fitted to.
             set_clip(SCREEN_WIDTH, SCREEN_HEIGHT, MAX_SCALE)
-        if window is not None:
-            WINDOW["value"] = window
-            WINDOW["at"] = time.monotonic()
+        # The window has just been moved and resized, so the cached geometry is stale.
+        WINDOW["at"] = 0.0
         self.reply(200, "application/json", json.dumps({
             "scale": percent, "width": width, "height": height,
             "screen": [SCREEN_WIDTH, SCREEN_HEIGHT],
