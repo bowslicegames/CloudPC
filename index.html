@@ -763,9 +763,16 @@ function controlUrl(path, params) {
   if (CONTROL_TOKEN) query.set("t", CONTROL_TOKEN);
   return path + "?" + query.toString();
 }
+/* Two steps may be out at once, not one. A step only needs its reply for the debug
+ * readout, but waiting for it before sending the next one made the round trip part
+ * of the cadence: on a 90 ms link the camera updated every 140 ms whatever the timer
+ * said, and the newest travel sat behind a reply nobody was waiting for. Two in
+ * flight keeps the cadence at the timer's 50 ms while still bounding how far the
+ * camera can run ahead of the finger. */
+const LOOK_IN_FLIGHT_MAX = 2;
 let look = null;
 let lookTimer = 0;
-let lookInFlight = false;
+let lookInFlight = 0;
 let lookSentAt = 0;
 let lookOk = 0;
 let lookFail = 0;
@@ -792,12 +799,12 @@ function sendLook(dx, dy) {
   const stepY = Math.round(dy * gain);
   if (!stepX && !stepY) return;
   lookStep = { x: stepX, y: stepY };
-  lookInFlight = true;
+  lookInFlight += 1;
   /* One request that never settles used to leave lookInFlight set for the life of the
    * page: one lost reply and the camera was dead until a reload, which is exactly how
    * this failed before. The travel stays queued, so a timeout costs nothing. */
   const stop = new AbortController();
-  const deadline = setTimeout(() => stop.abort(), 2000);
+  const deadline = setTimeout(() => stop.abort(), 900);
   fetch(controlUrl(LOOK_URL, { dx: stepX, dy: stepY }), {
     cache: "no-store",
     signal: stop.signal,
@@ -819,12 +826,13 @@ function sendLook(dx, dy) {
     .catch(() => { lookFail += 1; lookNote = "no reply"; })
     .finally(() => {
       clearTimeout(deadline);
-      lookInFlight = false;
+      lookInFlight = Math.max(0, lookInFlight - 1);
       /* Whatever travel arrived while this request was out has been collecting in
        * lookTravel. Send it as one bigger step rather than queueing a request
        * behind this one: on a slow link a queue grows every second and the view
-       * ends up a second behind the finger. One request in flight bounds the lag
-       * at one round trip, and no motion is lost, because the deltas add up. */
+       * ends up a second behind the finger. The cap on steps in flight bounds the
+       * lag at a fixed two round trips, and no motion is lost, because the deltas
+       * add up. */
       if (lookTravel.x || lookTravel.y) queueLook();
       showLookDebug();
     });
@@ -832,7 +840,7 @@ function sendLook(dx, dy) {
 
 function flushLook() {
   if (lookTimer) { clearTimeout(lookTimer); lookTimer = 0; }
-  if (lookInFlight) return;
+  if (lookInFlight >= LOOK_IN_FLIGHT_MAX) return;
   const dx = lookTravel.x;
   const dy = lookTravel.y;
   if (!dx && !dy) return;
@@ -843,7 +851,7 @@ function flushLook() {
 }
 
 function queueLook() {
-  if (lookTimer || lookInFlight) return;
+  if (lookTimer || lookInFlight >= LOOK_IN_FLIGHT_MAX) return;
   const wait = LOOK_INTERVAL - (performance.now() - lookSentAt);
   if (wait <= 0) {
     flushLook();

@@ -347,6 +347,27 @@ set_options_default maxFps 60 30
 # picks the largest scale that fits: 2 at full size, 1 once the Detail control has
 # shrunk the window below 640x480, and back up when it grows.
 set_options_default guiScale 2 0
+# View and simulation distance are the two settings that trade the most frame time
+# for the least code, so they can be set from the app's environment instead of from
+# the in-game sliders: every chunk inside the view is meshed and drawn on this one
+# core, and going from radius 3 to 2 removes 24 of the 49 chunks. Only an explicit
+# value is written, so an environment without them leaves the sliders alone.
+set_option_value() {
+  local key="$1" value="$2"
+  [[ -f "$INSTANCE_OPTIONS" ]] || return 0
+  if grep -q "^${key}:" "$INSTANCE_OPTIONS"; then
+    sed -i "s/^${key}:.*\$/${key}:${value}/" "$INSTANCE_OPTIONS"
+  else
+    printf '%s:%s\n' "$key" "$value" >> "$INSTANCE_OPTIONS"
+  fi
+  echo "CloudPC: option ${key}:${value} from the environment"
+}
+if [[ "${RENDER_DISTANCE:-}" =~ ^[0-9]+$ ]] && (( RENDER_DISTANCE >= 2 && RENDER_DISTANCE <= 32 )); then
+  set_option_value renderDistance "$RENDER_DISTANCE"
+fi
+if [[ "${SIMULATION_DISTANCE:-}" =~ ^[0-9]+$ ]] && (( SIMULATION_DISTANCE >= 3 && SIMULATION_DISTANCE <= 32 )); then
+  set_option_value simulationDistance "$SIMULATION_DISTANCE"
+fi
 
 # Options that only add per-frame work and that an older options.txt does not
 # contain at all. Each is written once and then belongs to the game: a key that is
@@ -363,6 +384,12 @@ add_options_default() {
 # are in view at once -- and biome colours are blended per block unless this is 0.
 add_options_default entityDistanceScaling 0.5
 add_options_default biomeBlendRadius 0
+# Minecraft writes every chunk it unloads, and every player-data change, with a fsync
+# by default, which on a mounted volume is a stall a tick cannot hide. Nothing here
+# is crash-safe by contract: the world is a game, and a lost second of it after a
+# hard kill costs less than the hitch every autosave puts in the frame the player is
+# looking at. A key that is already there, including one set by hand, is untouched.
+add_options_default syncChunkWrites false
 
 # Every pixel of the Minecraft window is shaded on the CPU, so the seeded instance
 # draws the world at half resolution and upscales it: a quarter of the pixels for
@@ -571,7 +598,7 @@ fi
 # desktop can be diagnosed from the log instead of guessed at. nproc is what the
 # host reports, which is why llvmpipe needs the cgroup quota instead of it.
 read -r STREAM_WIDTH STREAM_HEIGHT < <(stream_size)
-echo "CloudPC: performance -- ${CPU_BUDGET} CPU core(s) allowed (nproc $(nproc)), llvmpipe ${LP_NUM_THREADS} thread(s), framebuffer ${SCREEN_WIDTH}x${SCREEN_HEIGHT} (PIXEL_OFFLOAD=${PIXEL_OFFLOAD:-0}, UI scale ${UI_SCALE}), stream ${STREAM_WIDTH}x${STREAM_HEIGHT} at $(stream_scale)% of it, ${VNC_WAIT}/${VNC_DEFER} ms, Minecraft on Serial GC with ${JAVA_CPUS} core(s)."
+echo "CloudPC: performance -- ${CPU_BUDGET} CPU core(s) allowed (nproc $(nproc)), llvmpipe ${LP_NUM_THREADS} thread(s), framebuffer ${SCREEN_WIDTH}x${SCREEN_HEIGHT} (PIXEL_OFFLOAD=${PIXEL_OFFLOAD:-0}, UI scale ${UI_SCALE}), stream ${STREAM_WIDTH}x${STREAM_HEIGHT} at $(stream_scale)% of it, ${VNC_WAIT}/${VNC_DEFER} ms, Minecraft on Serial GC with ${JAVA_CPUS} core(s), view $(sed -n 's/^renderDistance://p' "$INSTANCE_OPTIONS" 2>/dev/null | head -n1)/sim $(sed -n 's/^simulationDistance://p' "$INSTANCE_OPTIONS" 2>/dev/null | head -n1)."
 case "$GL_RENDERER_LINE" in
   *softpipe*)
     echo "WARNING: Mesa is on softpipe, which is several times slower than llvmpipe. Check that libgl1-mesa-dri is installed; GALLIUM_DRIVER=llvmpipe forces the fast rasteriser."
@@ -908,7 +935,11 @@ if [[ "$SESSION" == "lite" ]] && command -v openbox >/dev/null 2>&1; then
 
   # AUTOSTART_PRISM=0 leaves the desktop empty (right-click the background for the menu).
   if [[ "${AUTOSTART_PRISM:-1}" == "1" ]] && command -v prismlauncher >/dev/null 2>&1; then
-    runuser -u cloud -- env "${SESSION_ENV[@]}" prismlauncher &
+    # The launcher stays open behind the game and is a whole Qt application plus its
+    # own JVM: animations, a status timer, a heap of its own. It has nothing to do
+    # while Minecraft is fullscreen on the stream, so it yields to the game rather
+    # than sharing the core with it.
+    runuser -u cloud -- env "${SESSION_ENV[@]}" nice -n 10 prismlauncher &
     PRISM_PID=$!
     echo "CloudPC: Prism Launcher started (session memory kept off the game's core)."
   else
@@ -1000,8 +1031,15 @@ fi
 
 # websockify only has to carry the RFB socket now; noVNC's files and the mouse
 # endpoint are served by mouseproxy.py on the exposed port, in front of it.
+#
+# It used to run at nice 19, on the reasoning that a late pixel costs nothing. That
+# is wrong for half of what it carries: RFB is one socket, and the player's keys and
+# trackpad presses travel up the same relay as the frames coming down. A relay that
+# is starved for a slice does not only make the picture late, it makes the controls
+# late, which is the one delay a player feels directly. 10 still yields the core to
+# the game first, without putting input behind a full frame's worth of pixels.
 echo "CloudPC: starting websockify on 127.0.0.1:${WS_PORT}..."
-nice -n 19 websockify "127.0.0.1:${WS_PORT}" "127.0.0.1:${VNC_PORT}" &
+nice -n 10 websockify "127.0.0.1:${WS_PORT}" "127.0.0.1:${VNC_PORT}" &
 WS_PID=$!
 
 WS_READY=0
