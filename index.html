@@ -983,11 +983,20 @@ passwordCancel.addEventListener("click", () => {
  * The container's CPU is the bottleneck and the device looking at the stream is
  * idle, so the server should compress as little as possible: decompressing and
  * scaling the picture is nearly free in the browser, while every byte x11vnc
- * compresses is CPU taken away from Minecraft. */
+ * compresses is CPU taken away from Minecraft.
+ *
+ * JPEG quality is the other half of that trade, and it is what makes a VNC stream
+ * look grainy. It matters more here than in a normal session: the framebuffer is
+ * 800x500 and a tablet magnifies it past 2000 device pixels, so one 8x8 JPEG block
+ * covers several pixels of the screen — and the sharpening pass on top makes every
+ * block edge visible. Quality 5, what Fast used to send, is where Minecraft's
+ * terrain turns into noise at that size. 7 to 9 keeps the blocks under the size the
+ * upscale can show; the three modes now trade zlib level instead, which is the part
+ * that costs the container CPU. */
 const STREAM_MODES = [
-  { name: "Fast", title: "Fast stream: least server CPU, more bandwidth", compression: 0, quality: 5 },
-  { name: "Balanced", title: "Balanced stream: noVNC defaults", compression: 2, quality: 7 },
-  { name: "Sharp", title: "Sharp stream: least bandwidth, most server CPU", compression: 6, quality: 9 },
+  { name: "Fast", title: "Fast stream: no zlib, least server CPU, more bandwidth", compression: 0, quality: 7 },
+  { name: "Balanced", title: "Balanced stream: a little zlib, one quality step up", compression: 2, quality: 8 },
+  { name: "Sharp", title: "Sharp stream: most zlib, least bandwidth, most server CPU", compression: 6, quality: 9 },
 ];
 const STREAM_KEY = "cloudpc.streamMode";
 let streamMode = 0;
@@ -1015,12 +1024,14 @@ function applyStreamMode(connection) {
  * artifacts are magnified more than they are at full size — and grain is the one
  * thing the GPU stage cannot fix, because what it does is sharpen. The encoder is
  * also working on fewer pixels, so the same preset can afford a higher quality
- * there. 800x500 keeps the preset exactly as it is. */
+ * there. The shipped 800x500 (400,000 pixels) gets one step as well, because a
+ * tablet magnifies it just as much: 8 in Fast, 9 in Balanced and Sharp. */
 function qualityFor(setting) {
   const pixels = canvas ? canvas.width * canvas.height : 0;
   if (!pixels) return setting.quality;
   if (pixels <= 200000) return Math.min(9, setting.quality + 3);
   if (pixels <= 320000) return Math.min(9, setting.quality + 2);
+  if (pixels <= 420000) return Math.min(9, setting.quality + 1);
   return setting.quality;
 }
 
