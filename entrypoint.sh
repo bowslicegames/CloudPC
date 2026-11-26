@@ -573,10 +573,13 @@ echo "CloudPC: session bus is listening (${DBUS_ADDRESS%%,guid=*})."
 #     grows just enough to hold it, never past the ceiling Xvfb allocated at boot,
 #     and comes back as soon as the window is gone.
 #
-# Minecraft is left alone: fit_game_window below gives it the whole framebuffer on
-# purpose, because every pixel there is game. The loop costs a handful of small X
-# queries every two seconds, and only asks a window its name when it is not already
-# where it should be.
+# Desktop furniture is skipped before it is measured or moved. In xfce mode the
+# panel and the wallpaper window are in the same client list as the applications
+# (a DOCK and a DESKTOP), so fitting them would shrink and move the panel and the
+# wallpaper like any application window. Minecraft is left alone too: fit_game_window
+# below gives it the whole framebuffer on purpose, because every pixel there is game.
+# The loop costs a couple of small X queries per window every two seconds, and only
+# asks a window its name when it is not already where it should be.
 client_windows() {
   # The windows openbox manages, from its own list. Searching the window tree would
   # also turn up menus, tooltips and other override-redirect windows, which are not
@@ -591,9 +594,18 @@ window_geometry() {
     | sed -n 's/^X=//p;s/^Y=//p;s/^WIDTH=//p;s/^HEIGHT=//p' | paste -sd' '
 }
 
+# The window's _NET_WM_WINDOW_TYPE atoms, space separated. Most applications set no
+# type at all and print nothing here, which leaves them ordinary windows to fit.
+window_type() {
+  # -notype drops the "(ATOM)" after the property name, so match around it: the
+  # line is "_NET_WM_WINDOW_TYPE = _NET_WM_WINDOW_TYPE_DOCK" either way.
+  DISPLAY=:0 xprop -id "$1" -notype _NET_WM_WINDOW_TYPE 2>/dev/null \
+    | sed -n 's/^_NET_WM_WINDOW_TYPE[^=]*= *//p'
+}
+
 fit_windows() {
   local margin="${WINDOW_MARGIN}" titlebar="${WINDOW_TITLEBAR}"
-  local wid name state gx gy gw gh sw sh avail_w avail_h
+  local wid name type state gx gy gw gh sw sh avail_w avail_h
   local want_w want_h needed_w needed_h target_x target_y warn_key last_warn=""
   while kill -0 "$XVFB_PID" 2>/dev/null; do
     read -r sw sh < <(screen_size) || true
@@ -614,6 +626,15 @@ fit_windows() {
       if (( gw < 16 || gh < 16 )); then
         continue
       fi
+      # Skip the session's own furniture: the panel (DOCK), the desktop background
+      # (DESKTOP) and any tooltip a toolkit manages for itself. They have no titlebar
+      # and are not the user's to resize; fitting the panel and the wallpaper would
+      # shrink and move them, and their geometry must not count towards the screen
+      # size either.
+      type="$(window_type "$wid")"
+      case "$type" in
+        *DOCK*|*DESKTOP*|*TOOLTIP*) continue ;;
+      esac
       avail_w=$(( sw - 2 * margin ))
       avail_h=$(( sh - titlebar - 2 * margin ))
       if (( avail_w < 64 )); then avail_w=64; fi
