@@ -169,6 +169,7 @@ button[aria-pressed="true"],button.primary{background:var(--accent);color:var(--
     <button id="trackpadBtn" type="button" title="Trackpad (touch pointer)" aria-label="Trackpad" aria-pressed="false">🖱</button>
     <button id="controlsBtn" type="button" title="Game controls" aria-label="Game controls" aria-pressed="false">🎮</button>
     <button id="fullscreenBtn" type="button" title="Fullscreen" aria-label="Fullscreen">⛶</button>
+    <button id="detailBtn" type="button" title="Picture detail">Auto</button>
     <button id="streamBtn" type="button" title="Stream quality">Fast</button>
     <button id="upscaleBtn" type="button" title="GPU upscale (WebGPU)" aria-pressed="true">GPU off</button>
     <button id="reconnect" class="primary" type="button">Reconnect</button>
@@ -253,6 +254,7 @@ const trackpadBtn = document.querySelector("#trackpadBtn");
 const controlsBtn = document.querySelector("#controlsBtn");
 const fullscreenBtn = document.querySelector("#fullscreenBtn");
 const streamBtn = document.querySelector("#streamBtn");
+const detailBtn = document.querySelector("#detailBtn");
 const upscaleBtn = document.querySelector("#upscaleBtn");
 const trackpadEl = document.querySelector("#trackpad");
 const controlsEl = document.querySelector("#controls");
@@ -1079,6 +1081,7 @@ setInterval(() => {
   frameCount = 0;
   fpsValue = fpsValue ? fpsValue * 0.5 + rate * 0.5 : rate;
   if (fpsEl) fpsEl.textContent = Math.round(fpsValue) + " fps";
+  governFps();
 }, 1000);
 
 applyStreamMode(null);
@@ -1087,6 +1090,166 @@ streamBtn.addEventListener("click", () => {
   try { localStorage.setItem(STREAM_KEY, String(streamMode)); } catch { /* ignore */ }
   applyStreamMode(rfb);
 });
+
+/* ---------- how many pixels the container has to produce per frame ----------
+ *
+ * A frame costs the container pixels at every stage after the world is drawn: the
+ * HUD and the upscale to the window, the copy out of llvmpipe, x11vnc reading the
+ * damage, JPEGing it, and websockify shipping it. RenderScale already made the
+ * world cheap by drawing it at a third of the window, but all of that still ran at
+ * the full 800x500 — 400,000 pixels — however small the world was.
+ *
+ * So the stream is now a rectangle the container chooses. x11vnc's -clip sends that
+ * sub-region as the VNC framebuffer and the game window is sized to the same
+ * rectangle at 0,0, so nothing between the game and this canvas touches a pixel
+ * outside it: at 50% every stage handles a quarter of the pixels, and the device
+ * upscales what arrives with the GPU stage it already had.
+ *
+ * Auto aims that rectangle at a frame rate instead of picking one: it steps down
+ * while the measured rate stays under the target and back up when there is room, so
+ * the picture is as large as this container can actually keep up with.
+ */
+const DETAIL_KEY = "cloudpc.detail";
+const DETAIL_LEVELS = [100, 80, 62, 50, 40];
+const DETAIL_NAMES = ["Full", "Large", "Medium", "Small", "Tiny"];
+const DETAIL_TARGET = 20;
+let detailAuto = true;
+let detailIndex = 1;
+let detailSynced = false;
+let gameRunning = false;
+let detailSlow = 0;
+let detailFast = 0;
+let detailChanged = 0;
+
+try {
+  const saved = localStorage.getItem(DETAIL_KEY);
+  if (saved === null || saved === "auto") {
+    detailAuto = true;
+  } else {
+    const stored = Number(saved);
+    if (Number.isInteger(stored) && stored >= 0 && stored < DETAIL_LEVELS.length) {
+      detailIndex = stored;
+      detailAuto = false;
+    }
+  }
+} catch { /* storage can be blocked; Auto stands */ }
+
+function paintDetail() {
+  if (!detailBtn) return;
+  const percent = DETAIL_LEVELS[detailIndex];
+  detailBtn.textContent = detailAuto ? "Auto " + percent + "%" : DETAIL_NAMES[detailIndex];
+  detailBtn.title = detailAuto
+    ? "Picture detail: Auto, aiming for " + DETAIL_TARGET + " fps at " + percent +
+      "% of the desktop. Tap to cut detail for more frames."
+    : "Picture detail: " + percent + "% of the desktop, " + DETAIL_NAMES[detailIndex] +
+      ". Tap to trade more detail for more frames.";
+  detailBtn.setAttribute("aria-pressed", detailAuto ? "false" : "true");
+}
+
+function rememberDetail() {
+  try {
+    localStorage.setItem(DETAIL_KEY, detailAuto ? "auto" : String(detailIndex));
+  } catch { /* ignore */ }
+}
+
+async function applyDetail(level, manual) {
+  if (manual) detailAuto = false;
+  detailIndex = Math.max(0, Math.min(DETAIL_LEVELS.length - 1, level));
+  detailChanged = performance.now();
+  detailSlow = 0;
+  detailFast = 0;
+  rememberDetail();
+  paintDetail();
+  const percent = DETAIL_LEVELS[detailIndex];
+  try {
+    const response = await fetch("/cloudpc/stream", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-CloudPC": "1" },
+      body: JSON.stringify({ scale: percent }),
+    });
+    if (!response.ok) return;
+    const state = await response.json();
+    /* With no game window the choice is only remembered for the next one. */
+    gameRunning = !!state.game;
+    /* Then check the stream really is that size instead of trusting the request:
+     * the canvas is the one place the effect is visible. */
+    setTimeout(() => {
+      if (canvas && state.width && Math.abs(canvas.width - state.width) > 1) {
+        console.warn("CloudPC: the stream is still " + canvas.width +
+          " wide; x11vnc did not take the new region.");
+      }
+    }, 2500);
+  } catch { /* the next poll reports where we are */ }
+}
+
+/* One control, one direction: tap repeatedly to spend detail on frames, and the
+ * last tap hands the choice back to Auto. */
+detailBtn?.addEventListener("click", () => {
+  if (detailIndex < DETAIL_LEVELS.length - 1) {
+    applyDetail(detailIndex + 1, true);
+    return;
+  }
+  detailAuto = true;
+  rememberDetail();
+  paintDetail();
+  detailChanged = performance.now();
+  detailSlow = 0;
+  detailFast = 0;
+});
+
+function governFps() {
+  const now = performance.now();
+  if (!detailAuto || !gameRunning) {
+    detailSlow = 0;
+    detailFast = 0;
+    return;
+  }
+  /* Let the last change settle: the game re-creates its framebuffer and the stream
+   * re-sends a whole screen, and judging either while it happens is wrong. */
+  if (now - detailChanged < 7000) return;
+  /* A static desktop also measures as zero frames, and that is not a slow game:
+   * only a stream that is visibly running but under the target is worth shrinking. */
+  if (fpsValue >= 1 && fpsValue < DETAIL_TARGET * 0.85) {
+    detailSlow += 1;
+    detailFast = 0;
+  } else if (fpsValue >= DETAIL_TARGET * 1.4) {
+    detailFast += 1;
+    detailSlow = 0;
+  } else {
+    detailSlow = 0;
+    detailFast = 0;
+  }
+  if (detailSlow >= 5 && detailIndex < DETAIL_LEVELS.length - 1) {
+    applyDetail(detailIndex + 1, false);
+  } else if (detailFast >= 10 && detailIndex > 0) {
+    applyDetail(detailIndex - 1, false);
+  }
+}
+
+/* Where the container is, so Auto knows whether a low frame rate means the game is
+ * slow (and the stream should shrink) or that nothing is being drawn at all. */
+async function pollStream() {
+  try {
+    const response = await fetch("/cloudpc/stream", { cache: "no-store" });
+    if (response.ok) {
+      const state = await response.json();
+      gameRunning = !!state.game;
+      if (!detailSynced) {
+        detailSynced = true;
+        if (detailAuto && state.scale) {
+          const match = DETAIL_LEVELS.indexOf(Number(state.scale));
+          if (match >= 0) { detailIndex = match; paintDetail(); }
+        }
+      }
+    }
+  } catch {
+    gameRunning = false;
+  }
+  setTimeout(pollStream, 5000);
+}
+
+paintDetail();
+pollStream();
 
 /* ---------- the GPU stage: the device draws the last part of the frame ----------
  *
@@ -1470,6 +1633,13 @@ function connect() {
     connection.showDotCursor = true;
     connection.viewOnly = false;
     connection.dragViewport = false;
+
+    /* The stream can change size mid-session (x11vnc re-clips to the game window),
+     * and the quality preset is chosen from that size, so it is re-applied here. */
+    connection.addEventListener("desktopsize", () => {
+      adoptCanvas(connection);
+      reapplyStreamModeWhenSized(connection);
+    });
 
     connection.addEventListener("connect", () => {
       adoptCanvas(connection);

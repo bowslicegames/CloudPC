@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """The one port the browser talks to: noVNC's files, the RFB websocket, and mouse look.
 
-Three kinds of request arrive here:
+These requests arrive here:
 
     GET  /...             noVNC's files, including our index.html
     GET  /websockify      (Upgrade: websocket) relayed byte for byte to websockify
     POST /cloudpc/mouse   {"dx":..,"dy":..} moved through XTEST as *relative* motion
+    GET  /cloudpc/stream  the stream size, the screen size, whether the game is up
+    POST /cloudpc/stream  {"scale":40..100} resize the stream and the game window
 
 The last one is what makes mouse look work. RFB carries absolute pointer positions
 only, so a look update always had to be "a point on the desktop". But Minecraft does
@@ -32,6 +34,7 @@ import json
 import mimetypes
 import os
 import socket
+import subprocess
 import sys
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -46,6 +49,102 @@ MAX_STEP = 2000
 # Look requests are cheap, but there is no reason for a page to send thousands a
 # second at a one-core desktop.
 MAX_BODY = 4096
+
+# The stream's rectangle, as a percentage of the screen, remembered on the data
+# volume so a redeploy keeps the setting. The game window and x11vnc's clip are both
+# this rectangle, which is why the picture is all game at any size.
+SCREEN_WIDTH = int(os.environ.get("CLOUDPC_SCREEN_WIDTH", "800"))
+SCREEN_HEIGHT = int(os.environ.get("CLOUDPC_SCREEN_HEIGHT", "500"))
+STREAM_FILE = os.environ.get("CLOUDPC_STREAM_FILE", "/data/.config/cloudpc-stream")
+MIN_SCALE = 40
+MAX_SCALE = 100
+# Every child process talks to the same X display as the pointer injection.
+CHILD_ENV = dict(os.environ, DISPLAY=DISPLAY, HOME=os.environ.get("HOME", "/home/cloud"))
+
+
+def run(command, timeout=6):
+    """Run a small X helper, returning None instead of raising when it is missing,
+    slow or killed. None of these calls is worth failing a request over."""
+    try:
+        return subprocess.run(command, capture_output=True, text=True,
+                              timeout=timeout, env=CHILD_ENV)
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def stream_size(percent):
+    """Pixel size of the stream for a percentage of the screen. Even numbers,
+    because JPEG chroma comes in pairs and the upscaler prefers them."""
+    width = max(128, SCREEN_WIDTH * percent // 100 // 2 * 2)
+    height = max(80, SCREEN_HEIGHT * percent // 100 // 2 * 2)
+    return width, height
+
+
+def stream_scale():
+    """The remembered percentage, or None when nothing has been chosen yet."""
+    try:
+        with open(STREAM_FILE, encoding="utf-8") as handle:
+            digits = "".join(c for c in handle.read() if c.isdigit())[:3]
+    except OSError:
+        return None
+    if not digits:
+        return None
+    return max(MIN_SCALE, min(MAX_SCALE, int(digits)))
+
+
+def remember_scale(percent):
+    try:
+        os.makedirs(os.path.dirname(STREAM_FILE), exist_ok=True)
+        with open(STREAM_FILE, "w", encoding="utf-8") as handle:
+            handle.write("%d\n" % percent)
+    except OSError as error:
+        print("mouseproxy: cannot remember the stream size: %s" % error, flush=True)
+
+
+def game_window():
+    """Minecraft's window, if it is on screen: its id and its client geometry."""
+    found = run(["xdotool", "search", "--onlyvisible", "--name", "^Minecraft"])
+    if found is None or not found.stdout.split():
+        return None
+    wid = found.stdout.split()[0]
+    info = run(["xdotool", "getwindowgeometry", "--shell", wid])
+    if info is None:
+        return None
+    values = {}
+    for line in info.stdout.splitlines():
+        key, _, value = line.partition("=")
+        values[key.strip()] = value.strip()
+    try:
+        return {"id": wid, "x": int(values["X"]), "y": int(values["Y"]),
+                "width": int(values["WIDTH"]), "height": int(values["HEIGHT"])}
+    except (KeyError, ValueError):
+        return None
+
+
+def set_clip(width, height, percent=None):
+    """Ask the running x11vnc for a framebuffer rectangle through its remote-control
+    channel (an X property, not a new connection). The session keeps its client: the
+    framebuffer simply becomes this size and noVNC resizes its canvas to match.
+
+    The poll cadence comes with it. It is the encoder's batching, and it is what caps
+    the stream when nothing else does: a quarter of the pixels is cheap enough to ship
+    every 28 ms instead of every 46, so a smaller stream is not still held at twenty
+    updates a second. Both are remote-control parameters too."""
+    result = run(["x11vnc", "-R", "clip:%dx%d+0+0" % (width, height)], timeout=8)
+    applied = result is not None and result.returncode == 0
+    if percent is not None:
+        wait, defer = (12, 16) if percent <= 80 else (16, 30)
+        run(["x11vnc", "-R", "wait:%d" % wait], timeout=6)
+        run(["x11vnc", "-R", "defer:%d" % defer], timeout=6)
+    return applied
+
+
+def stream_state():
+    percent = stream_scale()
+    width, height = stream_size(percent or MAX_SCALE)
+    return {"scale": percent, "width": width, "height": height,
+            "screen": [SCREEN_WIDTH, SCREEN_HEIGHT],
+            "game": game_window() is not None}
 
 
 class Pointer:
@@ -145,6 +244,8 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.headers.get("Upgrade", "").lower() == "websocket":
             return self.tunnel()
+        if urlsplit(self.path).path == "/cloudpc/stream":
+            return self.reply(200, "application/json", json.dumps(stream_state()))
         self.serve_static()
 
     def serve_static(self):
@@ -229,28 +330,46 @@ class Handler(BaseHTTPRequestHandler):
     # ---------- mouse look ----------
 
     def do_POST(self):
-        if urlsplit(self.path).path != "/cloudpc/mouse":
-            return self.reply(404, "text/plain", "not found")
-        # A custom header cannot be attached by another site without a CORS
-        # preflight, which this server never approves, so only our own page can
-        # steer the pointer.
+        path = urlsplit(self.path).path
+        if path == "/cloudpc/mouse":
+            return self.mouse_look()
+        if path == "/cloudpc/stream":
+            return self.resize_stream()
+        return self.reply(404, "text/plain", "not found")
+
+    def trusted(self):
+        """Only our own page may steer the pointer or resize the stream: a custom
+        header cannot be attached by another site without a CORS preflight, which
+        this server never approves."""
         if self.headers.get("X-CloudPC") != "1":
-            return self.reply(403, "text/plain", "forbidden")
+            self.reply(403, "text/plain", "forbidden")
+            return False
         origin = self.headers.get("Origin")
         if origin and urlsplit(origin).netloc not in ("", self.headers.get("Host")):
-            return self.reply(403, "text/plain", "forbidden")
+            self.reply(403, "text/plain", "forbidden")
+            return False
+        return True
 
+    def json_body(self):
         try:
             length = int(self.headers.get("Content-Length") or 0)
         except ValueError:
             length = 0
         if length <= 0 or length > MAX_BODY:
-            return self.reply(400, "text/plain", "bad request")
+            return None
         try:
-            body = json.loads(self.rfile.read(length) or b"{}")
+            return json.loads(self.rfile.read(length) or b"{}")
+        except (ValueError, json.JSONDecodeError):
+            return None
+
+    def mouse_look(self):
+        if not self.trusted():
+            return
+        body = self.json_body()
+        try:
             dx = int(round(float(body.get("dx", 0))))
             dy = int(round(float(body.get("dy", 0))))
-        except (ValueError, TypeError, AttributeError, json.JSONDecodeError):
+        except (ValueError, TypeError, AttributeError):
             return self.reply(400, "text/plain", "bad request")
 
         if POINTER is None:
@@ -261,6 +380,42 @@ class Handler(BaseHTTPRequestHandler):
         self.reply(200, "application/json", json.dumps({
             "dx": dx, "dy": dy,
             "x": where.get("x"), "y": where.get("y"),
+        }))
+
+    def resize_stream(self):
+        """Trade detail for frames, live.
+
+        The game window and x11vnc's clip are set to the same rectangle, so every
+        stage between the game and the browser handles fewer pixels: the HUD, the
+        world blit, the frame copy, the read, the JPEG and the websocket. With no
+        game window open the choice is only remembered, for the next time one opens;
+        the desktop keeps the whole screen it was fitted to.
+        """
+        if not self.trusted():
+            return
+        body = self.json_body()
+        try:
+            percent = int(round(float(body.get("scale"))))
+        except (ValueError, TypeError, AttributeError):
+            return self.reply(400, "text/plain", "bad request")
+        percent = max(MIN_SCALE, min(MAX_SCALE, percent))
+        remember_scale(percent)
+        width, height = stream_size(percent)
+        window = game_window()
+        applied = False
+        if window is not None:
+            run(["xdotool", "windowmove", "--sync", window["id"], "0", "0"])
+            run(["xdotool", "windowsize", "--sync", window["id"],
+                 str(width), str(height)])
+            applied = set_clip(width, height, percent)
+        else:
+            # No game to send: choosing a level is remembered for the next one, and
+            # the desktop goes back to the whole screen it was fitted to.
+            set_clip(SCREEN_WIDTH, SCREEN_HEIGHT, MAX_SCALE)
+        self.reply(200, "application/json", json.dumps({
+            "scale": percent, "width": width, "height": height,
+            "screen": [SCREEN_WIDTH, SCREEN_HEIGHT],
+            "game": window is not None, "applied": applied,
         }))
 
 

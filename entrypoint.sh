@@ -48,13 +48,9 @@ unset OFFLOAD_WIDTH OFFLOAD_HEIGHT
 # old desktop back.
 : "${SESSION:=lite}"
 # How long x11vnc sleeps between framebuffer polls and how long it batches damage
-# before encoding. Saving CPU here costs a few milliseconds of stream latency.
-# 16 + 30 ms is about 20 updates a second, more than a phone shows over a mobile
-# link, and it lets one encode carry a whole batch instead of two encodes carrying
-# half of it each. The old 8/12 polled and encoded roughly twice as often for the
-# same picture, on the core Minecraft was drawing on.
-: "${VNC_WAIT:=16}"
-: "${VNC_DEFER:=30}"
+# before encoding. Saving CPU here costs a few milliseconds of stream latency, and
+# what the encoder can afford depends on how many pixels the stream carries, so both
+# are set with the stream size below instead of here.
 
 # glibc gives every thread its own malloc arena (8 x cores of 64 MB mappings). On
 # a one-core container with Java, Mesa and GTK all allocating, capping the arenas
@@ -106,6 +102,76 @@ export vblank_mode=0 MESA_SHADER_CACHE_DISABLE=false
 if [[ "${GLTHREAD:-0}" == "1" ]]; then
   export mesa_glthread=true
   echo "CloudPC: Mesa threaded GL dispatch on (GLTHREAD=1)."
+fi
+
+CPU_BUDGET="$(cgroup_cpu_limit)"
+
+# ---------------------------------------------------------------------------
+# The stream is a rectangle
+#
+# Every stage between the game and the device costs the same number of pixels, and
+# they all run on this container's CPU: llvmpipe shades the HUD and blits the world
+# onto the window, the driver copies the frame out, x11vnc reads the damaged
+# rectangles, JPEGs them, and websockify ships them. RenderScale already made the
+# *world* cheap by drawing it at a third of the window, which is why the terrain is
+# no longer what a frame costs; everything else still ran at the full 800x500, and
+# that is 400,000 pixels of work per frame however small the world is.
+#
+# So the stream itself is now a rectangle. x11vnc's -clip sends exactly that
+# sub-region as the VNC framebuffer, and the game window is sized to the same
+# rectangle at 0,0, so the picture is all game and every stage above shrinks with
+# it: at 50% the encoder reads, JPEGs and ships a quarter of the pixels. The device
+# upscales what arrives (index.html's WebGPU stage), and the rectangle is not fixed:
+# mouseproxy.py writes this file and asks the running x11vnc to re-clip through its
+# remote-control channel, so the page can trade detail for frames without dropping
+# the session. STREAM_SCALE=100 turns the whole thing off.
+STREAM_FILE="${STREAM_FILE:-/data/.config/cloudpc-stream}"
+
+# A container with one and a bit cores cannot afford to start at full size. Start
+# one step down there; a desktop with cores to spare starts at the whole screen.
+if (( CPU_BUDGET >= 3 )); then
+  DEFAULT_STREAM_SCALE=100
+else
+  DEFAULT_STREAM_SCALE=80
+fi
+
+stream_scale() {
+  local percent="${STREAM_SCALE:-}" digits
+  if [[ -z "$percent" && -r "$STREAM_FILE" ]]; then
+    digits="$(tr -cd '0-9' < "$STREAM_FILE" 2>/dev/null | head -c 3 || true)"
+    percent="${digits:-}"
+  fi
+  if [[ ! "$percent" =~ ^[0-9]+$ ]]; then
+    percent="$DEFAULT_STREAM_SCALE"
+  fi
+  if (( percent < 40 )); then percent=40; fi
+  if (( percent > 100 )); then percent=100; fi
+  echo "$percent"
+}
+
+# "W H" of the stream: even numbers, because JPEG chroma comes in pairs and the
+# upscaler prefers them, and never smaller than a legible window.
+stream_size() {
+  local percent width height
+  percent="$(stream_scale)"
+  width=$(( SCREEN_WIDTH * percent / 100 / 2 * 2 ))
+  height=$(( SCREEN_HEIGHT * percent / 100 / 2 * 2 ))
+  if (( width < 128 )); then width=128; fi
+  if (( height < 80 )); then height=80; fi
+  echo "$width $height"
+}
+
+# The stream's own timing. A smaller framebuffer is cheap to read and encode, so it
+# can be shipped more often: at 640x400 and below the encoder's share of a core is
+# small enough that a 28 ms poll-and-batch still leaves the game the core, and the
+# stream stops being what caps the picture at twenty updates a second. At full size
+# the old 46 ms stays, because there every encode is four times the work.
+if (( $(stream_scale) <= 80 )); then
+  : "${VNC_WAIT:=12}"
+  : "${VNC_DEFER:=16}"
+else
+  : "${VNC_WAIT:=16}"
+  : "${VNC_DEFER:=30}"
 fi
 
 mkdir -p /data/.vnc /data/.minecraft /data/.local/share/PrismLauncher \
@@ -190,21 +256,50 @@ set_instance_default MinecraftWinHeight 450 500
 # The other two flags are container wins: stop writing the perf counters through a
 # memory-mapped file, and cap the JIT compilers at two so a host with dozens of
 # cores cannot fill this container with compiler threads.
-# Only Prism's "use the defaults" state is replaced. Once the value is written, or
-# the user changes it in Prism, it is left alone.
-CLOUDPC_JVM_ARGS='-XX:+UseSerialGC -XX:+PerfDisableSharedMem -XX:CICompilerCount=2'
-if [[ -f "$INSTANCE_CFG" ]] && ! grep -qx 'OverrideJavaArgs=true' "$INSTANCE_CFG"; then
-  if grep -qx 'OverrideJavaArgs=false' "$INSTANCE_CFG"; then
-    sed -i 's/^OverrideJavaArgs=false$/OverrideJavaArgs=true/' "$INSTANCE_CFG"
-  else
-    printf 'OverrideJavaArgs=true\n' >> "$INSTANCE_CFG"
+# The JVM sizes every pool it has from the host's core count, not from the cgroup
+# quota: on an eight-core host this container's Minecraft got a background executor,
+# a ForkJoin pool, Sodium's chunk builders and a dozen idling threads all sized for
+# eight cores, and all of them fighting for the one and a bit cores it actually
+# gets. -XX:ActiveProcessorCount tells the JVM the truth, so every one of those
+# pools, and Runtime.availableProcessors() that the mods read, matches the CPU the
+# container is allowed.
+JAVA_CPUS="$CPU_BUDGET"
+if (( JAVA_CPUS < 1 )); then JAVA_CPUS=1; fi
+if (( JAVA_CPUS > 16 )); then JAVA_CPUS=16; fi
+CLOUDPC_JVM_ARGS="-XX:+UseSerialGC -XX:+PerfDisableSharedMem -XX:CICompilerCount=2 -XX:ActiveProcessorCount=${JAVA_CPUS}"
+
+# Prism records "use the defaults" as OverrideJavaArgs=false, so that is the only
+# state that gets taken over. After that the args are ours until someone types their
+# own into Prism -- and those are recognised by not being the preset we wrote, so a
+# preset from an older build of this image is moved forward on the next boot while a
+# value the user chose is never touched.
+prism_jvm_args() {
+  local cfg="$1" current
+  [[ -f "$cfg" ]] || return 1
+  if grep -qx 'OverrideJavaArgs=false' "$cfg"; then
+    sed -i 's/^OverrideJavaArgs=false$/OverrideJavaArgs=true/' "$cfg"
+  elif ! grep -q '^OverrideJavaArgs=' "$cfg"; then
+    printf 'OverrideJavaArgs=true\n' >> "$cfg"
+  elif ! grep -qx 'OverrideJavaArgs=true' "$cfg"; then
+    return 1
   fi
-  if grep -q '^JvmArgs=' "$INSTANCE_CFG"; then
-    sed -i "s|^JvmArgs=.*\$|JvmArgs=${CLOUDPC_JVM_ARGS}|" "$INSTANCE_CFG"
-  else
-    printf 'JvmArgs=%s\n' "$CLOUDPC_JVM_ARGS" >> "$INSTANCE_CFG"
+  current="$(sed -n 's/^JvmArgs=//p' "$cfg" | tail -n 1)"
+  if [[ -n "$current" && "$current" != -XX:+UseSerialGC* ]]; then
+    return 1
   fi
-  echo "CloudPC: Minecraft JVM set to Serial GC for a ${LP_NUM_THREADS}-thread container"
+  if [[ "$current" == "$CLOUDPC_JVM_ARGS" ]]; then
+    return 1
+  fi
+  if grep -q '^JvmArgs=' "$cfg"; then
+    sed -i "s|^JvmArgs=.*\$|JvmArgs=${CLOUDPC_JVM_ARGS}|" "$cfg"
+  else
+    printf 'JvmArgs=%s\n' "$CLOUDPC_JVM_ARGS" >> "$cfg"
+  fi
+  echo "CloudPC: Minecraft JVM args set for ${JAVA_CPUS} CPU core(s) (Serial GC, APCount, 2 JIT threads)"
+  return 0
+}
+if [[ -f "$INSTANCE_CFG" ]]; then
+  prism_jvm_args "$INSTANCE_CFG" || true
 fi
 
 # Same idea for options.txt: terrain shading dominates the frame cost, so the
@@ -219,6 +314,10 @@ set_options_default() {
 }
 set_options_default renderDistance 4 3
 set_options_default simulationDistance 5 4
+# Ticking is the other half of the frame: with a 3-chunk view, four chunks of
+# simulation is the same world twice over. Three keeps every block in view ticking
+# and drops the ones that were only being simulated behind the player.
+set_options_default simulationDistance 4 3
 # The stream ships about 20 updates a second, so 30 fps is already more than the
 # picture can show. An uncapped menu, sky or paused game is the cheapest place to
 # hand a core back to the encoder and to everything else on the box.
@@ -446,8 +545,8 @@ fi
 # One line with every number that decides how fast this session can be, so a slow
 # desktop can be diagnosed from the log instead of guessed at. nproc is what the
 # host reports, which is why llvmpipe needs the cgroup quota instead of it.
-CPU_BUDGET="$(cgroup_cpu_limit)"
-echo "CloudPC: performance -- ${CPU_BUDGET} CPU core(s) allowed (nproc $(nproc)), llvmpipe ${LP_NUM_THREADS} thread(s), framebuffer ${SCREEN_WIDTH}x${SCREEN_HEIGHT} (PIXEL_OFFLOAD=${PIXEL_OFFLOAD:-0}, UI scale ${UI_SCALE}), stream ${VNC_WAIT}/${VNC_DEFER} ms, Minecraft on Serial GC."
+read -r STREAM_WIDTH STREAM_HEIGHT < <(stream_size)
+echo "CloudPC: performance -- ${CPU_BUDGET} CPU core(s) allowed (nproc $(nproc)), llvmpipe ${LP_NUM_THREADS} thread(s), framebuffer ${SCREEN_WIDTH}x${SCREEN_HEIGHT} (PIXEL_OFFLOAD=${PIXEL_OFFLOAD:-0}, UI scale ${UI_SCALE}), stream ${STREAM_WIDTH}x${STREAM_HEIGHT} at $(stream_scale)% of it, ${VNC_WAIT}/${VNC_DEFER} ms, Minecraft on Serial GC with ${JAVA_CPUS} core(s)."
 case "$GL_RENDERER_LINE" in
   *softpipe*)
     echo "WARNING: Mesa is on softpipe, which is several times slower than llvmpipe. Check that libgl1-mesa-dri is installed; GALLIUM_DRIVER=llvmpipe forces the fast rasteriser."
@@ -648,34 +747,71 @@ fit_windows() {
   done
 }
 
+# Ask the running x11vnc for a framebuffer rectangle, through its remote-control
+# channel: an X property on the display, not a new connection. The session is not
+# interrupted -- x11vnc starts sending that sub-region, reports the new size, and
+# noVNC resizes its canvas to match. Passing the whole screen turns the clip off
+# again, which is what happens when the game closes and the desktop comes back.
+set_stream_clip() {
+  local width="$1" height="$2" out
+  out="$(timeout 8 runuser -u cloud -- env HOME=/home/cloud DISPLAY=:0 \
+    x11vnc -R "clip:${width}x${height}+0+0" 2>&1 || true)"
+  echo "CloudPC: stream region ${width}x${height} at 0,0"
+  case "${out,,}" in
+    *error*|*fail*|*unknown*)
+      echo "CloudPC: x11vnc did not take that region: ${out//$'\n'/ }"
+      ;;
+  esac
+}
+
 fit_game_window() {
-  local wid="" last="" attempt geometry
+  local wid="" last="" attempt geometry stream_w stream_h clip_w clip_h last_clip=""
   while kill -0 "$XVFB_PID" 2>/dev/null; do
     wid="$(DISPLAY=:0 xdotool search --onlyvisible --name '^Minecraft' 2>/dev/null | head -n1 || true)"
     if [[ -z "$wid" ]]; then
       if [[ -n "$last" ]]; then
         echo "CloudPC: game window closed"
         last=""
+        last_clip=""
+        # The launcher and every window fitted to the screen need the whole
+        # framebuffer again, so the stream goes back to the full desktop.
+        set_stream_clip "$SCREEN_WIDTH" "$SCREEN_HEIGHT"
       fi
       sleep 2
       continue
     fi
+    read -r stream_w stream_h < <(stream_size)
     if [[ "$wid" != "$last" ]]; then
       last="$wid"
       # _MOTIF_WM_HINTS: ask the window manager for no titlebar and no border, so the
-      # client area really is the whole framebuffer and not the framebuffer minus a
-      # titlebar.
+      # client area really is the whole stream and not the stream minus a titlebar.
       DISPLAY=:0 xprop -id "$wid" -f _MOTIF_WM_HINTS 32c \
         -set _MOTIF_WM_HINTS '0x2, 0x0, 0x0, 0x0, 0x0' >/dev/null 2>&1 || true
       for attempt in 1 2 3; do
         sleep 1
         timeout 5 xdotool windowmove --sync "$wid" 0 0 >/dev/null 2>&1 || true
         timeout 5 xdotool windowsize --sync "$wid" \
-          "$SCREEN_WIDTH" "$SCREEN_HEIGHT" >/dev/null 2>&1 || true
+          "$stream_w" "$stream_h" >/dev/null 2>&1 || true
         timeout 5 xdotool windowraise "$wid" >/dev/null 2>&1 || true
       done
+      # The stream is exactly the game window now, so the desktop behind it is
+      # never read, JPEGed or shipped while you play.
+      set_stream_clip "$stream_w" "$stream_h"
+      last_clip="${stream_w}x${stream_h}"
       geometry="$(DISPLAY=:0 xdotool getwindowgeometry --shell "$wid" 2>/dev/null | tr '\n' ' ' || true)"
-      echo "CloudPC: game window ${wid} fitted to ${SCREEN_WIDTH}x${SCREEN_HEIGHT} at 0,0 (${geometry:-geometry unknown})"
+      echo "CloudPC: game window ${wid} fitted to ${stream_w}x${stream_h} at 0,0 (${geometry:-geometry unknown})"
+    else
+      # The game can resize itself afterwards (F11, a resolution or GUI scale
+      # change). That size is never overridden again, but the stream still has to
+      # show all of it, so the region follows the window instead of cropping it;
+      # the page asks for a smaller window again when the frame rate drops.
+      read -r _ _ clip_w clip_h < <(window_geometry "$wid") || true
+      if [[ "$clip_w" =~ ^[0-9]+$ && "$clip_h" =~ ^[0-9]+$ ]] \
+         && (( clip_w >= 96 && clip_h >= 96 )) \
+         && [[ "${clip_w}x${clip_h}" != "$last_clip" ]]; then
+        set_stream_clip "$clip_w" "$clip_h"
+        last_clip="${clip_w}x${clip_h}"
+      fi
     fi
     sleep 2
   done
@@ -849,6 +985,9 @@ runuser -u cloud -- env HOME=/home/cloud DISPLAY=:0 \
   CLOUDPC_WS_UPSTREAM="127.0.0.1:${WS_PORT}" \
   NOVNC_PORT="${NOVNC_PORT}" \
   CLOUDPC_DISPLAY=:0 \
+  CLOUDPC_SCREEN_WIDTH="${SCREEN_WIDTH}" \
+  CLOUDPC_SCREEN_HEIGHT="${SCREEN_HEIGHT}" \
+  CLOUDPC_STREAM_FILE="${STREAM_FILE}" \
   python3 /opt/cloudpc/mouseproxy.py &
 PROXY_PID=$!
 
