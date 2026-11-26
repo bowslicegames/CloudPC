@@ -28,19 +28,6 @@ if [[ -n "$OFFLOAD_WIDTH" && "$SCREEN_WIDTH" = "800" && "$SCREEN_HEIGHT" = "500"
 fi
 unset OFFLOAD_WIDTH OFFLOAD_HEIGHT
 
-# Xvfb cannot be made larger than the framebuffer it allocated when it started, and
-# no window manager will shrink a window below the minimum the application put in
-# WM_NORMAL_HINTS. Prism's Settings dialog is exactly that case: its minimum height
-# is larger than this desktop, which is why it opens cropped. So the framebuffer is
-# allocated at this ceiling and the desktop is shrunk to the size asked for;
-# fit_windows grows it back towards the ceiling for a window that needs the room and
-# shrinks it again when that window closes. A ceiling costs a few megabytes of
-# memory and no CPU: llvmpipe and the encoder only ever see the current screen size.
-: "${SCREEN_CEILING_WIDTH:=1024}"
-: "${SCREEN_CEILING_HEIGHT:=640}"
-if (( SCREEN_CEILING_WIDTH < SCREEN_WIDTH )); then SCREEN_CEILING_WIDTH="$SCREEN_WIDTH"; fi
-if (( SCREEN_CEILING_HEIGHT < SCREEN_HEIGHT )); then SCREEN_CEILING_HEIGHT="$SCREEN_HEIGHT"; fi
-
 # Desktop left visible around every window, and the titlebar openbox puts above it.
 # Both are in X pixels: they are the room a window leaves the desktop so its edges
 # and its titlebar stay visible and reachable on a touch screen.
@@ -418,22 +405,6 @@ screen_size() {
     | awk '/dimensions:/ { split($2, d, "x"); print d[1], d[2]; exit }'
 }
 
-# Asks the server for a screen size and waits until it is in effect. RANDR can
-# report BadMatch and apply nothing on the first request against a fresh Xvfb
-# screen, so the size is read back rather than trusted from the exit status.
-set_screen_size() {
-  local want_w="$1" want_h="$2" got_w="" got_h="" attempt
-  for attempt in 1 2 3; do
-    DISPLAY=:0 timeout 5 xrandr --fb "${want_w}x${want_h}" >/dev/null 2>&1 || true
-    read -r got_w got_h < <(screen_size) || true
-    if [[ "$got_w" == "$want_w" && "$got_h" == "$want_h" ]]; then
-      return 0
-    fi
-    sleep 0.4
-  done
-  return 1
-}
-
 start_xvfb() {
   local width="$1" height="$2" attempt
   rm -f /tmp/.X0-lock /tmp/.X11-unix/X0
@@ -453,37 +424,11 @@ start_xvfb() {
   return 1
 }
 
-echo "CloudPC: starting virtual display ${SCREEN_WIDTH}x${SCREEN_HEIGHT} (ceiling ${SCREEN_CEILING_WIDTH}x${SCREEN_CEILING_HEIGHT})..."
-if ! start_xvfb "$SCREEN_CEILING_WIDTH" "$SCREEN_CEILING_HEIGHT"; then
+echo "CloudPC: starting virtual display ${SCREEN_WIDTH}x${SCREEN_HEIGHT}..."
+if ! start_xvfb "$SCREEN_WIDTH" "$SCREEN_HEIGHT"; then
   echo "ERROR: Xvfb did not become ready."
   ps aux | grep '[X]vfb' || true
   exit 1
-fi
-
-# Shrink the display to the size this deployment asked for, before any X client
-# starts so nothing has to lay itself out twice. -noreset keeps the size even while
-# no client is connected to the server.
-SCREEN_NOW_W="" SCREEN_NOW_H=""
-set_screen_size "$SCREEN_WIDTH" "$SCREEN_HEIGHT" || true
-read -r SCREEN_NOW_W SCREEN_NOW_H < <(screen_size) || true
-if [[ "$SCREEN_NOW_W" != "$SCREEN_WIDTH" || "$SCREEN_NOW_H" != "$SCREEN_HEIGHT" ]]; then
-  # The server would not take the smaller size. Streaming a desktop several times
-  # the size that was asked for would cost real CPU on every frame, so restart it
-  # at exactly the requested size instead. The only thing lost is the room to grow a
-  # window later, and the log says which way it went.
-  echo "WARNING: the display would not shrink to ${SCREEN_WIDTH}x${SCREEN_HEIGHT} (it is ${SCREEN_NOW_W:-?}x${SCREEN_NOW_H:-?}). Restarting it at exactly that size; a window with a larger minimum will then stay cropped."
-  if [[ -n "$XVFB_PID" ]] && kill -0 "$XVFB_PID" 2>/dev/null; then
-    kill "$XVFB_PID" 2>/dev/null || true
-    wait "$XVFB_PID" 2>/dev/null || true
-    sleep 1
-  fi
-  if ! start_xvfb "$SCREEN_WIDTH" "$SCREEN_HEIGHT"; then
-    echo "ERROR: Xvfb did not become ready."
-    ps aux | grep '[X]vfb' || true
-    exit 1
-  fi
-  SCREEN_CEILING_WIDTH="$SCREEN_WIDTH"
-  SCREEN_CEILING_HEIGHT="$SCREEN_HEIGHT"
 fi
 
 # One line in the log that says what actually draws the desktop: a render node
@@ -562,16 +507,17 @@ echo "CloudPC: session bus is listening (${DBUS_ADDRESS%%,guid=*})."
 #
 # openbox does not fit anything: a window keeps the size the application asks for,
 # even when that is larger than the framebuffer, and a touch client has no way to
-# reach the edges it hangs over. Prism's Settings dialog is the hard case — its
-# height comes from its page layout's minimum, which grew in Prism 9 — and no window
-# manager can cross that minimum, because Qt publishes it in WM_NORMAL_HINTS and
-# openbox obeys the hint. So two mechanisms, and both are needed:
+# reach the edges it hangs over. Every window is moved fully into view and shrunk to
+# leave WINDOW_MARGIN of desktop around it, so its titlebar and its resize grips stay
+# reachable.
 #
-#   * every window is moved fully into view and shrunk to leave WINDOW_MARGIN of
-#     desktop around it, so its titlebar and its resize grips stay reachable;
-#   * a window that will not shrink far enough takes the desktop with it: the screen
-#     grows just enough to hold it, never past the ceiling Xvfb allocated at boot,
-#     and comes back as soon as the window is gone.
+# The framebuffer is never resized. Xvfb will change the screen size with
+# `xrandr --fb`, but it does that by disabling the output's CRTC: the RandR screen
+# then has no active monitor, glfwGetPrimaryMonitor() returns NULL and Minecraft
+# refuses to start fullscreen ("Failed to locate a primary monitor"). So the desktop
+# is the size asked for from boot and stays that size, and a window whose minimum is
+# larger — Prism's Settings dialog at small framebuffer sizes — is kept inside by
+# UI_SCALE, which shrinks that minimum along with the rest of the layout.
 #
 # Desktop furniture is skipped before it is measured or moved. In xfce mode the
 # panel and the wallpaper window are in the same client list as the applications
@@ -606,17 +552,14 @@ window_type() {
 fit_windows() {
   local margin="${WINDOW_MARGIN}" titlebar="${WINDOW_TITLEBAR}"
   local wid name type state gx gy gw gh sw sh avail_w avail_h
-  local want_w want_h needed_w needed_h target_x target_y warn_key last_warn=""
+  local target_x target_y warn_key last_warn=""
+  local -A refused=()
   while kill -0 "$XVFB_PID" 2>/dev/null; do
     read -r sw sh < <(screen_size) || true
     if [[ ! "$sw" =~ ^[0-9]+$ || ! "$sh" =~ ^[0-9]+$ ]]; then
       sleep 2
       continue
     fi
-    # The size this deployment asked for is the floor: growing for a dialog is
-    # temporary, so the screen has to find its way back here when the dialog closes.
-    want_w="$SCREEN_WIDTH"
-    want_h="$SCREEN_HEIGHT"
     for wid in $(client_windows); do
       read -r gx gy gw gh < <(window_geometry "$wid") || true
       if [[ ! "$gx" =~ ^-?[0-9]+$ || ! "$gy" =~ ^-?[0-9]+$ \
@@ -629,8 +572,7 @@ fit_windows() {
       # Skip the session's own furniture: the panel (DOCK), the desktop background
       # (DESKTOP) and any tooltip a toolkit manages for itself. They have no titlebar
       # and are not the user's to resize; fitting the panel and the wallpaper would
-      # shrink and move them, and their geometry must not count towards the screen
-      # size either.
+      # shrink and move them.
       type="$(window_type "$wid")"
       case "$type" in
         *DOCK*|*DESKTOP*|*TOOLTIP*) continue ;;
@@ -654,9 +596,13 @@ fit_windows() {
         case "$state" in
           *MAXIMIZED*|*FULLSCREEN*) continue ;;
         esac
-        # Ask for the smaller size. A window with a minimum simply stays as it was,
-        # which is why the geometry is read again instead of assumed.
-        if (( gw > avail_w || gh > avail_h )); then
+        # Ask for the smaller size, unless this window already refused exactly this
+        # size: a minimum it cannot cross would otherwise be retried every two
+        # seconds for as long as the window is open. A window whose size has changed
+        # since (the dialog switched page, the application resized itself) is tried
+        # again. The geometry is read back instead of assumed.
+        if (( gw > avail_w || gh > avail_h )) \
+              && [[ "${refused[$wid]:-}" != "${gw}x${gh}" ]]; then
           timeout 5 xdotool windowsize --sync "$wid" \
             "$(( gw < avail_w ? gw : avail_w ))" \
             "$(( gh < avail_h ? gh : avail_h ))" >/dev/null 2>&1 || true
@@ -664,6 +610,13 @@ fit_windows() {
           if [[ ! "$gx" =~ ^-?[0-9]+$ || ! "$gy" =~ ^-?[0-9]+$ \
                 || ! "$gw" =~ ^[0-9]+$ || ! "$gh" =~ ^[0-9]+$ ]]; then
             continue
+          fi
+          # Remember the size the window settled on when that is still too big, so
+          # the next pass does not ask again; clear it if it did shrink.
+          if (( gw > avail_w || gh > avail_h )); then
+            refused[$wid]="${gw}x${gh}"
+          else
+            unset 'refused[$wid]'
           fi
         fi
         # Move it fully inside the margin box. The client area sits below openbox's
@@ -680,33 +633,17 @@ fit_windows() {
         if (( target_x != gx || target_y != gy )); then
           timeout 5 xdotool windowmove --sync "$wid" "$target_x" "$target_y" >/dev/null 2>&1 || true
         fi
-      fi
-      # Every window left in the loop gets a say in the size of the desktop, whether
-      # it needed changing or not: if only the windows that were resized counted, the
-      # screen would shrink back the moment a grown-for window fitted, and grow again
-      # on the next pass, forever.
-      needed_w=$(( gw + 2 * margin ))
-      needed_h=$(( gh + titlebar + 2 * margin ))
-      if (( needed_w > want_w )); then
-        want_w="$(( needed_w < SCREEN_CEILING_WIDTH ? needed_w : SCREEN_CEILING_WIDTH ))"
-      fi
-      if (( needed_h > want_h )); then
-        want_h="$(( needed_h < SCREEN_CEILING_HEIGHT ? needed_h : SCREEN_CEILING_HEIGHT ))"
-      fi
-      if (( needed_w > SCREEN_CEILING_WIDTH || needed_h > SCREEN_CEILING_HEIGHT )); then
-        warn_key="$wid:$gw:$gh"
-        if [[ "$warn_key" != "$last_warn" ]]; then
-          last_warn="$warn_key"
-          echo "WARNING: window '${name}' keeps a minimum of ${gw}x${gh}, more room than this desktop can grow to (${SCREEN_CEILING_WIDTH}x${SCREEN_CEILING_HEIGHT}), so part of it stays off screen. Raise SCREEN_CEILING_WIDTH and SCREEN_CEILING_HEIGHT to show it whole."
+        # A window that will not shrink to what this desktop leaves for it is the one
+        # case fitting cannot solve alone. Say it once, with the knob that can.
+        if (( gw > avail_w || gh > avail_h )); then
+          warn_key="$wid:$gw:$gh"
+          if [[ "$warn_key" != "$last_warn" ]]; then
+            last_warn="$warn_key"
+            echo "WARNING: window '${name}' will not shrink below ${gw}x${gh}, but this desktop leaves ${avail_w}x${avail_h} for it, so part of it stays off screen. Lower UI_SCALE to make its layout smaller."
+          fi
         fi
       fi
     done
-    if (( want_w != sw || want_h != sh )); then
-      echo "CloudPC: desktop ${sw}x${sh} -> ${want_w}x${want_h} for the open window(s)."
-      # A refused resize must not stop the loop: this runs under set -e and a
-      # background job that dies leaves every later window unfitted.
-      set_screen_size "$want_w" "$want_h" || true
-    fi
     sleep 2
   done
 }
