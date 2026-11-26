@@ -163,7 +163,7 @@ button[aria-pressed="true"],button.primary{background:var(--accent);color:var(--
 <header id="toolbar">
   <strong>CloudPC</strong>
   <span id="status">Connecting to desktop…</span>
-  <span id="fps" title="Stream updates per second: how many new frames actually reach this device">-- fps</span>
+  <span id="fps" title="The game's frames per second while it runs, capped by the updates the stream delivers. A still picture sends no updates, which is not a slow game.">-- fps</span>
   <div class="buttons">
     <button id="keyboardBtn" type="button" title="On-screen keyboard" aria-label="On-screen keyboard">⌨</button>
     <button id="trackpadBtn" type="button" title="Trackpad (touch pointer)" aria-label="Trackpad" aria-pressed="false">🖱</button>
@@ -661,6 +661,7 @@ function setMode(next) {
   if (mode !== "trackpad") trackReset();
   if (mode !== "game") gameReset();
   lookDebugEl.hidden = mode !== "game";
+  if (mode === "game") showLookDebug();
   syncLock();
 }
 
@@ -751,6 +752,7 @@ let lookOk = 0;
 let lookFail = 0;
 let lookStep = { x: 0, y: 0 };
 let lookPointer = "";
+let lookNote = "";
 const lookTravel = { x: 0, y: 0 };
 
 function showLookDebug() {
@@ -758,7 +760,8 @@ function showLookDebug() {
   lookDebugEl.textContent =
     "look " + lookStep.x + "," + lookStep.y +
     "  pointer " + (lookPointer || "?") +
-    "\nsent " + lookOk + "  failed " + lookFail;
+    "\nsent " + lookOk + "  failed " + lookFail +
+    (lookNote ? "  " + lookNote : "");
 }
 
 /* One request per tick. The pointer position the desktop reports back is what tells
@@ -771,20 +774,35 @@ function sendLook(dx, dy) {
   if (!stepX && !stepY) return;
   lookStep = { x: stepX, y: stepY };
   lookInFlight = true;
+  /* One request that never settles used to leave lookInFlight set for the life of the
+   * page: one lost reply and the camera was dead until a reload, which is exactly how
+   * this failed before. The travel stays queued, so a timeout costs nothing. */
+  const stop = new AbortController();
+  const deadline = setTimeout(() => stop.abort(), 2000);
   fetch(LOOK_URL, {
     method: "POST",
     headers: { "Content-Type": "application/json", "X-CloudPC": "1" },
     body: JSON.stringify({ dx: stepX, dy: stepY }),
     cache: "no-store",
+    signal: stop.signal,
   })
-    .then(response => (response.ok ? response.json().catch(() => ({})) : null))
-    .then(data => {
-      if (!data) { lookFail += 1; return; }
+    .then(response => response.json()
+      .catch(() => ({}))
+      .then(data => ({ response, data })))
+    .then(({ response, data }) => {
+      if (!response.ok || data.ok === false) {
+        lookFail += 1;
+        lookNote = (response.ok ? "" : "http " + response.status) +
+          (data && data.error ? " " + data.error : "");
+        return;
+      }
       lookOk += 1;
+      lookNote = "";
       if (Number.isFinite(data.x)) lookPointer = data.x + "," + data.y;
     })
-    .catch(() => { lookFail += 1; })
+    .catch(() => { lookFail += 1; lookNote = "no reply"; })
     .finally(() => {
+      clearTimeout(deadline);
       lookInFlight = false;
       /* Whatever travel arrived while this request was out has been collecting in
        * lookTravel. Send it as one bigger step rather than queueing a request
@@ -1049,38 +1067,67 @@ function reapplyStreamModeWhenSized(connection) {
   tick();
 }
 
-/* Count frames as they are drawn. noVNC paints each update into the canvas with
- * drawImage (JPEG rectangles) or putImageData (raw ones), and it holds the context
- * object itself, so wrapping those two methods counts updates without touching
- * noVNC. It is the stream's rate, which is the number that decides how smooth the
- * picture feels — the game's own frame rate is only visible in F3. */
-let frameCount = 0;
-let fpsValue = 0;
+/* Count the stream's updates, not the canvas's draw calls.
+ *
+ * noVNC paints one update as one or more rectangles, so counting drawImage and
+ * putImageData counted pieces of frames — a screen where only the HUD moved reported
+ * a fraction of a frame. RFB fires exactly one "framebufferupdate" per update, and it
+ * only fires when pixels changed: that is why a still picture read zero, and why zero
+ * was never a measurement of the game's speed. The container measures the game's own
+ * frames separately (fpswatch.py, from the damage the game's window receives) and
+ * reports them with the stream state. The stream rate stays as the fallback and as the
+ * ceiling, because a game at 30 fps whose picture arrives at 12 is a 12 fps view. */
+let streamFrames = 0;
+let streamFps = 0;
+let streamSeen = 0;
+let gameFps = null;
 let fpsLast = 0;
 
-function hookFrameCounter(element) {
-  if (!element || element.dataset.fpsHooked === "1") return;
-  const context = element.getContext("2d");
-  if (!context) return;
-  element.dataset.fpsHooked = "1";
-  for (const name of ["drawImage", "putImageData"]) {
-    const original = context[name];
-    if (typeof original !== "function") continue;
-    context[name] = function (...args) {
-      frameCount += 1;
-      return original.apply(this, args);
-    };
+function hookStreamCounter(connection) {
+  if (!connection || connection.cloudpcCounted) return;
+  connection.cloudpcCounted = true;
+  connection.addEventListener("framebufferupdate", () => {
+    streamFrames += 1;
+    streamSeen = performance.now();
+  });
+}
+
+/* Two numbers matter and they are not the same one: the frames the game draws, and the
+ * updates the stream delivers. What reaches the device is never more than both, so the
+ * smaller of the two is shown while the picture is genuinely moving. A couple of
+ * updates a second is not a ceiling on the game, though — it is a still picture with a
+ * water animation in it, and the game's own rate is the truthful number there. */
+const STREAM_BUSY = 5;
+function visibleFps() {
+  const live = performance.now() - streamSeen < 1500;
+  const game = Number.isFinite(gameFps) && gameFps >= 1 ? gameFps : null;
+  if (game !== null) {
+    if (live && streamFps >= STREAM_BUSY) return Math.min(game, streamFps);
+    return game;
   }
+  if (live && streamFps >= 1) return streamFps;
+  return null;
+}
+
+function paintFps() {
+  if (!fpsEl) return;
+  const value = visibleFps();
+  if (value === null) {
+    fpsEl.textContent = streamSeen ? "still" : "-- fps";
+    return;
+  }
+  fpsEl.textContent = Math.round(value) + " fps";
 }
 
 setInterval(() => {
   const now = performance.now();
   const seconds = fpsLast ? (now - fpsLast) / 1000 : 1;
   fpsLast = now;
-  const rate = frameCount / Math.max(seconds, 0.25);
-  frameCount = 0;
-  fpsValue = fpsValue ? fpsValue * 0.5 + rate * 0.5 : rate;
-  if (fpsEl) fpsEl.textContent = Math.round(fpsValue) + " fps";
+  const rate = streamFrames / Math.max(seconds, 0.25);
+  streamFrames = 0;
+  const live = now - streamSeen < 1500;
+  streamFps = live ? (streamFps ? streamFps * 0.5 + rate * 0.5 : rate) : 0;
+  paintFps();
   governFps();
 }, 1000);
 
@@ -1207,12 +1254,21 @@ function governFps() {
   /* Let the last change settle: the game re-creates its framebuffer and the stream
    * re-sends a whole screen, and judging either while it happens is wrong. */
   if (now - detailChanged < 7000) return;
-  /* A static desktop also measures as zero frames, and that is not a slow game:
-   * only a stream that is visibly running but under the target is worth shrinking. */
-  if (fpsValue >= 1 && fpsValue < DETAIL_TARGET * 0.85) {
+  const fps = visibleFps();
+  /* Nothing measured: the game reports no frames and nothing has been drawn. That is
+   * a stream with nothing to send, not a slow one, and shrinking would be a guess. */
+  if (fps === null) {
+    detailSlow = 0;
+    detailFast = 0;
+    return;
+  }
+  if (fps < DETAIL_TARGET * 0.85) {
     detailSlow += 1;
     detailFast = 0;
-  } else if (fpsValue >= DETAIL_TARGET * 1.4) {
+  } else if (fps >= DETAIL_TARGET * 1.4 && streamFps >= 12) {
+    /* Spend detail again only on a picture the stream can actually carry: a paused
+     * or loading game draws quickly, and a stream that is only delivering a dozen
+     * updates would spend the detail and hand it straight back. */
     detailFast += 1;
     detailSlow = 0;
   } else {
@@ -1227,13 +1283,16 @@ function governFps() {
 }
 
 /* Where the container is, so Auto knows whether a low frame rate means the game is
- * slow (and the stream should shrink) or that nothing is being drawn at all. */
+ * slow (and the stream should shrink) or that nothing is being drawn at all — and how
+ * fast the game itself is drawing, which is the number a still picture cannot give.
+ * Once a second: it is a few hundred bytes next to the stream. */
 async function pollStream() {
   try {
     const response = await fetch("/cloudpc/stream", { cache: "no-store" });
     if (response.ok) {
       const state = await response.json();
       gameRunning = !!state.game;
+      gameFps = Number.isFinite(state.fps) ? state.fps : null;
       if (!detailSynced) {
         detailSynced = true;
         if (detailAuto && state.scale) {
@@ -1244,8 +1303,9 @@ async function pollStream() {
     }
   } catch {
     gameRunning = false;
+    gameFps = null;
   }
-  setTimeout(pollStream, 5000);
+  setTimeout(pollStream, 1000);
 }
 
 paintDetail();
@@ -1604,7 +1664,7 @@ function adoptCanvas(connection) {
   element.addEventListener("mousemove", event => {
     cursor = { x: event.clientX, y: event.clientY };
   }, true);
-  hookFrameCounter(element);
+  hookStreamCounter(connection);
   reapplyStreamModeWhenSized(connection);
   ensureGpuStage();
 }

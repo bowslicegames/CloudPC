@@ -37,6 +37,7 @@ import socket
 import subprocess
 import sys
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import unquote, urlsplit
 
@@ -44,6 +45,8 @@ WEB_ROOT = os.path.abspath(os.environ.get("CLOUDPC_WEB_ROOT", "/usr/share/novnc"
 WS_UPSTREAM = os.environ.get("CLOUDPC_WS_UPSTREAM", "127.0.0.1:8081")
 DISPLAY = os.environ.get("CLOUDPC_DISPLAY", ":0")
 PORT = int(os.environ.get("NOVNC_PORT", "8080"))
+# Written by fpswatch.py: the game's own frame rate, or absent when no game is up.
+FPS_FILE = os.environ.get("CLOUDPC_FPS_FILE", "/tmp/cloudpc-fps")
 # A single swipe interval is a few dozen pixels; anything near this is a client bug.
 MAX_STEP = 2000
 # Look requests are cheap, but there is no reason for a page to send thousands a
@@ -101,6 +104,37 @@ def remember_scale(percent):
         print("mouseproxy: cannot remember the stream size: %s" % error, flush=True)
 
 
+# Looking the game window up costs an xdotool process, and it changes rarely, so the
+# answer is shared for a couple of seconds instead of being asked for per request.
+WINDOW = {"at": 0.0, "value": None}
+WINDOW_LOCK = threading.Lock()
+
+
+def current_window():
+    with WINDOW_LOCK:
+        now = time.monotonic()
+        if now - WINDOW["at"] >= 2.0:
+            WINDOW["at"] = now
+            WINDOW["value"] = game_window()
+        return WINDOW["value"]
+
+
+def game_fps():
+    """The game's own frame rate, as fpswatch.py last measured it.
+
+    None when no game is up or the reading has stopped moving, so the page can fall
+    back to its own stream counter instead of showing a number that froze. The file
+    is written by a separate process for exactly this reason.
+    """
+    try:
+        if time.time() - os.path.getmtime(FPS_FILE) > 4:
+            return None
+        with open(FPS_FILE, encoding="utf-8") as handle:
+            return int(handle.read().strip())
+    except (OSError, ValueError):
+        return None
+
+
 def game_window():
     """Minecraft's window, if it is on screen: its id and its client geometry."""
     found = run(["xdotool", "search", "--onlyvisible", "--name", "^Minecraft"])
@@ -142,9 +176,10 @@ def set_clip(width, height, percent=None):
 def stream_state():
     percent = stream_scale()
     width, height = stream_size(percent or MAX_SCALE)
+    window = current_window()
     return {"scale": percent, "width": width, "height": height,
             "screen": [SCREEN_WIDTH, SCREEN_HEIGHT],
-            "game": game_window() is not None}
+            "game": window is not None, "fps": game_fps() if window else None}
 
 
 class Pointer:
@@ -163,6 +198,16 @@ class Pointer:
 
         unsigned_long = ctypes.c_ulong
         integer = ctypes.c_int
+        self.x11.XGetInputFocus.argtypes = [
+            ctypes.c_void_p, ctypes.POINTER(ctypes.c_ulong), ctypes.POINTER(ctypes.c_int)]
+        self.x11.XSetInputFocus.argtypes = [
+            ctypes.c_void_p, ctypes.c_ulong, ctypes.c_int, ctypes.c_ulong]
+        self.x11.XWarpPointer.argtypes = [
+            ctypes.c_void_p, ctypes.c_ulong, ctypes.c_ulong,
+            ctypes.c_int, ctypes.c_int, ctypes.c_uint, ctypes.c_uint,
+            ctypes.c_int, ctypes.c_int]
+        self.prepared = 0.0
+
         self.x11.XQueryPointer.restype = ctypes.c_int
         self.x11.XQueryPointer.argtypes = [
             ctypes.c_void_p, unsigned_long,
@@ -195,23 +240,62 @@ class Pointer:
         """Where the pointer is now, for the page's debug line: if this does not move
         when a look update is sent, the injection is not reaching X at all."""
         with self.lock:
-            root = self.x11.XDefaultRootWindow(self.display)
-            root_ret = ctypes.c_ulong()
-            child_ret = ctypes.c_ulong()
-            root_x = ctypes.c_int()
-            root_y = ctypes.c_int()
-            win_x = ctypes.c_int()
-            win_y = ctypes.c_int()
-            mask = ctypes.c_uint()
-            found = self.x11.XQueryPointer(
-                self.display, root,
-                ctypes.byref(root_ret), ctypes.byref(child_ret),
-                ctypes.byref(root_x), ctypes.byref(root_y),
-                ctypes.byref(win_x), ctypes.byref(win_y),
-                ctypes.byref(mask))
-            if not found:
-                return None
-            return {"x": root_x.value, "y": root_y.value}
+            return self.position_locked()
+
+    def position_locked(self):
+        root = self.x11.XDefaultRootWindow(self.display)
+        root_ret = ctypes.c_ulong()
+        child_ret = ctypes.c_ulong()
+        root_x = ctypes.c_int()
+        root_y = ctypes.c_int()
+        win_x = ctypes.c_int()
+        win_y = ctypes.c_int()
+        mask = ctypes.c_uint()
+        found = self.x11.XQueryPointer(
+            self.display, root,
+            ctypes.byref(root_ret), ctypes.byref(child_ret),
+            ctypes.byref(root_x), ctypes.byref(root_y),
+            ctypes.byref(win_x), ctypes.byref(win_y),
+            ctypes.byref(mask))
+        if not found:
+            return None
+        return {"x": root_x.value, "y": root_y.value}
+
+    def prepare(self, window):
+        """Make sure the game is what will receive the next motion.
+
+        XTEST moves the pointer of the window under it, or of the client that holds
+        the pointer grab while it plays. A game that lost the focus does neither: it
+        reads no mouse at all and pauses, so a look update goes nowhere however
+        correct the delta is — which is what a tap on the desktop beside a windowed
+        game can cause. The focus is checked a few times a second and re-asserted only
+        when it is wrong, and a pointer that ended up outside the window is put back
+        inside it, because relative motion is delivered to the window under it.
+        """
+        now = time.monotonic()
+        if window is None or now - self.prepared < 1.0:
+            return False
+        try:
+            window_id = int(window["id"], 10)
+        except (KeyError, TypeError, ValueError):
+            return False
+        self.prepared = now
+        with self.lock:
+            current = ctypes.c_ulong()
+            revert = ctypes.c_int()
+            if self.x11.XGetInputFocus(
+                    self.display, ctypes.byref(current), ctypes.byref(revert)) \
+                    and current.value != window_id:
+                self.x11.XSetInputFocus(self.display, window_id, 2, 0)
+            where = self.position_locked()
+            inside = (where is not None
+                      and window["x"] <= where["x"] < window["x"] + window["width"]
+                      and window["y"] <= where["y"] < window["y"] + window["height"])
+            if not inside:
+                self.x11.XWarpPointer(self.display, 0, window_id, 0, 0, 0, 0,
+                                      window["width"] // 2, window["height"] // 2)
+            self.x11.XFlush(self.display)
+        return True
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -370,16 +454,25 @@ class Handler(BaseHTTPRequestHandler):
             dx = int(round(float(body.get("dx", 0))))
             dy = int(round(float(body.get("dy", 0))))
         except (ValueError, TypeError, AttributeError):
-            return self.reply(400, "text/plain", "bad request")
+            return self.reply(400, "application/json",
+                              json.dumps({"ok": False, "error": "bad request"}))
 
-        if POINTER is None:
-            return self.reply(503, "text/plain", "no X display")
-        if not POINTER.move(dx, dy):
-            return self.reply(500, "text/plain", "injection failed")
-        where = POINTER.position() or {}
+        pointer = open_pointer()
+        if pointer is None:
+            return self.reply(503, "application/json",
+                              json.dumps({"ok": False, "error": "no X display"}))
+        window = current_window()
+        pointer.prepare(window)
+        if not pointer.move(dx, dy):
+            return self.reply(500, "application/json",
+                              json.dumps({"ok": False, "error": "injection failed"}))
+        where = pointer.position() or {}
+        # Every failure says why: the page prints this on its debug line, so a dead
+        # look path is one glance away from its cause instead of a bare "?".
         self.reply(200, "application/json", json.dumps({
-            "dx": dx, "dy": dy,
+            "ok": True, "dx": dx, "dy": dy,
             "x": where.get("x"), "y": where.get("y"),
+            "game": window is not None,
         }))
 
     def resize_stream(self):
@@ -412,6 +505,9 @@ class Handler(BaseHTTPRequestHandler):
             # No game to send: choosing a level is remembered for the next one, and
             # the desktop goes back to the whole screen it was fitted to.
             set_clip(SCREEN_WIDTH, SCREEN_HEIGHT, MAX_SCALE)
+        if window is not None:
+            WINDOW["value"] = window
+            WINDOW["at"] = time.monotonic()
         self.reply(200, "application/json", json.dumps({
             "scale": percent, "width": width, "height": height,
             "screen": [SCREEN_WIDTH, SCREEN_HEIGHT],
@@ -420,17 +516,38 @@ class Handler(BaseHTTPRequestHandler):
 
 
 POINTER = None
+POINTER_RETRY = 0.0
+POINTER_LOCK = threading.Lock()
+
+
+def open_pointer():
+    """The X connection, opened again if it could not be opened at boot.
+
+    A display that was a moment late at startup must not disable mouse look for the
+    life of the container, which is what a single failed attempt at boot did.
+    """
+    global POINTER, POINTER_RETRY
+    if POINTER is not None:
+        return POINTER
+    with POINTER_LOCK:
+        if POINTER is not None:
+            return POINTER
+        if time.monotonic() < POINTER_RETRY:
+            return None
+        POINTER_RETRY = time.monotonic() + 3.0
+        try:
+            POINTER = Pointer(DISPLAY)
+            print("mouseproxy: relative mouse on %s (XTEST)" % DISPLAY, flush=True)
+        except (OSError, SystemExit) as error:
+            print("mouseproxy: relative mouse disabled: %s" % error, flush=True)
+    return POINTER
 
 
 def main():
-    global POINTER
     # A desktop that cannot be opened is the entrypoint's problem, not this
     # process': noVNC should still be served so the failure is visible instead of
-    # the whole app going away.
-    try:
-        POINTER = Pointer(DISPLAY)
-    except (OSError, SystemExit) as error:
-        print("mouseproxy: relative mouse disabled: %s" % error, flush=True)
+    # the whole app going away. open_pointer retries on the next look update.
+    open_pointer()
     server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
     server.request_queue_size = 64
     server.daemon_threads = True

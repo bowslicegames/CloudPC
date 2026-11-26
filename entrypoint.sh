@@ -126,6 +126,9 @@ CPU_BUDGET="$(cgroup_cpu_limit)"
 # remote-control channel, so the page can trade detail for frames without dropping
 # the session. STREAM_SCALE=100 turns the whole thing off.
 STREAM_FILE="${STREAM_FILE:-/data/.config/cloudpc-stream}"
+# Where fpswatch.py publishes the game's own frame rate. A file, not a socket: the
+# page reads it from mouseproxy, and nothing waits on the process that writes it.
+FPS_FILE="${FPS_FILE:-/tmp/cloudpc-fps}"
 
 # A container with one and a bit cores cannot afford to start at full size. Start
 # one step down there; a desktop with cores to spare starts at the whole screen.
@@ -895,6 +898,25 @@ else
   DESKTOP_PID=$!
 fi
 
+# The page can only count stream updates, and x11vnc sends nothing while the picture
+# does not change — so a still camera read as zero frames a second although the game
+# was drawing thirty. fpswatch.py counts the game's own frames instead: one large
+# damage event on its window per presented frame, still picture or not. It is a
+# separate process writing a number to /tmp and nothing depends on it: the page
+# falls back to the stream rate when the file is absent or stale.
+if command -v xdotool >/dev/null 2>&1; then
+  rm -f "$FPS_FILE"
+  runuser -u cloud -- env HOME=/home/cloud DISPLAY=:0 \
+    CLOUDPC_DISPLAY=:0 CLOUDPC_FPS_FILE="$FPS_FILE" \
+    python3 /opt/cloudpc/fpswatch.py &
+  FPS_PID=$!
+  if kill -0 "$FPS_PID" 2>/dev/null; then
+    echo "CloudPC: the game's frame rate is measured from its window damage."
+  else
+    echo "WARNING: fpswatch did not start; the page will count stream updates only."
+  fi
+fi
+
 # Fits every window of the session, the launcher included. Nothing here is a game
 # window, so this is the one that keeps dialogs and the launcher whole on screen.
 if [[ "${FIT_WINDOWS:-1}" == "1" ]] && command -v xdotool >/dev/null 2>&1; then
@@ -988,6 +1010,7 @@ runuser -u cloud -- env HOME=/home/cloud DISPLAY=:0 \
   CLOUDPC_SCREEN_WIDTH="${SCREEN_WIDTH}" \
   CLOUDPC_SCREEN_HEIGHT="${SCREEN_HEIGHT}" \
   CLOUDPC_STREAM_FILE="${STREAM_FILE}" \
+  CLOUDPC_FPS_FILE="${FPS_FILE}" \
   python3 /opt/cloudpc/mouseproxy.py &
 PROXY_PID=$!
 
