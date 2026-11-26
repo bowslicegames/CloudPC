@@ -82,6 +82,31 @@ cgroup_cpu_limit() {
   nproc
 }
 
+# The same quota as a percentage of one core, which is the number the rules below
+# actually care about. cgroup_cpu_limit() rounds up, because a container given 1.25
+# cores still gets to run a whole extra thread's worth above one core. That rounding
+# is wrong for deciding whether there is a *second core*: 125% is not 200%, and a
+# thread placed on the difference gets scheduled against the game's own threads.
+cgroup_cpu_percent() {
+  local quota period
+  if [[ -r /sys/fs/cgroup/cpu.max ]]; then
+    read -r quota period < /sys/fs/cgroup/cpu.max || true
+    if [[ "$quota" =~ ^[0-9]+$ ]] && [[ "${period:-0}" =~ ^[0-9]+$ ]] && (( period > 0 )); then
+      echo $(( quota * 100 / period ))
+      return 0
+    fi
+  fi
+  if [[ -r /sys/fs/cgroup/cpu/cpu.cfs_quota_us && -r /sys/fs/cgroup/cpu/cpu.cfs_period_us ]]; then
+    read -r quota < /sys/fs/cgroup/cpu/cpu.cfs_quota_us || true
+    read -r period < /sys/fs/cgroup/cpu/cpu.cfs_period_us || true
+    if [[ "$quota" =~ ^[0-9]+$ ]] && [[ "${period:-0}" =~ ^[0-9]+$ ]] && (( period > 0 )) && (( quota > 0 )); then
+      echo $(( quota * 100 / period ))
+      return 0
+    fi
+  fi
+  echo $(( $(nproc) * 100 ))
+}
+
 LP_NUM_THREADS="${LP_NUM_THREADS:-$(cgroup_cpu_limit)}"
 if ! [[ "${LP_NUM_THREADS:-}" =~ ^[1-9][0-9]*$ ]]; then
   LP_NUM_THREADS=1
@@ -90,11 +115,14 @@ MESA_SHADER_CACHE_DIR="${MESA_SHADER_CACHE_DIR:-/data/.cache/mesa}"
 MESA_SHADER_CACHE_MAX_SIZE="${MESA_SHADER_CACHE_MAX_SIZE:-512M}"
 export LP_NUM_THREADS MESA_SHADER_CACHE_DIR MESA_SHADER_CACHE_MAX_SIZE
 
-# Two driver-level knobs that cost nothing: never wait for a display refresh (the
-# swap only feeds a framebuffer that x11vnc reads, and Minecraft already runs with
-# vsync off), and leave Mesa's shader cache alone so the LLVM JIT does not rebuild
-# programs it has already compiled.
-export vblank_mode=0 MESA_SHADER_CACHE_DISABLE=false
+# Driver-level knobs that cost nothing: never wait for a display refresh (the swap only
+# feeds a framebuffer that x11vnc reads, and Minecraft already runs with vsync off),
+# leave Mesa's shader cache alone so the LLVM JIT does not rebuild programs it has
+# already compiled, and skip GL error bookkeeping. MESA_NO_ERROR drops the per-call
+# error state tracking in the driver, which on a CPU rasteriser is pure overhead: the
+# only consumer is Minecraft, and a GL error it does not check is not reported either
+# way. Nothing here changes a pixel.
+export vblank_mode=0 MESA_SHADER_CACHE_DISABLE=false MESA_NO_ERROR=1
 # Name the fast software rasteriser instead of letting Mesa choose: when it cannot
 # prove the pixels are aligned it falls back to softpipe, which is several times
 # slower, and "the desktop is suddenly unusable" would then have no visible cause.
@@ -105,15 +133,21 @@ fi
 # Mesa's threaded GL dispatch moves the OpenGL command stream onto a second thread,
 # which is where Minecraft's ~30% on Mesa drivers comes from. It needs a second core
 # to land on: on one core the extra thread only adds hand-offs, so it is on by default
-# where the cgroup allows two, off below that. GLTHREAD=1 forces it on and GLTHREAD=0
-# forces it off.
+# where the cgroup really allows two, off below that. The test is the raw quota rather
+# than the rounded thread count, because a 125% allocation rounds up to two raster
+# threads — which is right, those threads share the whole quota while the render thread
+# is blocked in a draw — but it is not a second core for a thread that has to run
+# *alongside* the game. GLTHREAD=1 forces it on and GLTHREAD=0 forces it off.
+CPU_PERCENT="$(cgroup_cpu_percent)"
 GLTHREAD="${GLTHREAD:-auto}"
 if [[ "$GLTHREAD" == "auto" ]]; then
-  if (( LP_NUM_THREADS >= 2 )); then GLTHREAD=1; else GLTHREAD=0; fi
+  if (( CPU_PERCENT >= 175 )); then GLTHREAD=1; else GLTHREAD=0; fi
 fi
 if [[ "$GLTHREAD" == "1" ]]; then
   export mesa_glthread=true
   echo "CloudPC: Mesa threaded GL dispatch on (GLTHREAD=1)."
+else
+  echo "CloudPC: Mesa threaded GL dispatch off: ${CPU_PERCENT}% of a core is not a second core to put it on (GLTHREAD=1 forces it on)."
 fi
 
 CPU_BUDGET="$(cgroup_cpu_limit)"
@@ -598,7 +632,7 @@ fi
 # desktop can be diagnosed from the log instead of guessed at. nproc is what the
 # host reports, which is why llvmpipe needs the cgroup quota instead of it.
 read -r STREAM_WIDTH STREAM_HEIGHT < <(stream_size)
-echo "CloudPC: performance -- ${CPU_BUDGET} CPU core(s) allowed (nproc $(nproc)), llvmpipe ${LP_NUM_THREADS} thread(s), framebuffer ${SCREEN_WIDTH}x${SCREEN_HEIGHT} (PIXEL_OFFLOAD=${PIXEL_OFFLOAD:-0}, UI scale ${UI_SCALE}), stream ${STREAM_WIDTH}x${STREAM_HEIGHT} at $(stream_scale)% of it, ${VNC_WAIT}/${VNC_DEFER} ms, Minecraft on Serial GC with ${JAVA_CPUS} core(s), view $(sed -n 's/^renderDistance://p' "$INSTANCE_OPTIONS" 2>/dev/null | head -n1)/sim $(sed -n 's/^simulationDistance://p' "$INSTANCE_OPTIONS" 2>/dev/null | head -n1)."
+echo "CloudPC: performance -- ${CPU_BUDGET} CPU core(s) allowed (quota ${CPU_PERCENT}%, nproc $(nproc)), llvmpipe ${LP_NUM_THREADS} thread(s), framebuffer ${SCREEN_WIDTH}x${SCREEN_HEIGHT} (PIXEL_OFFLOAD=${PIXEL_OFFLOAD:-0}, UI scale ${UI_SCALE}), stream ${STREAM_WIDTH}x${STREAM_HEIGHT} at $(stream_scale)% of it, ${VNC_WAIT}/${VNC_DEFER} ms, Minecraft on Serial GC with ${JAVA_CPUS} core(s), view $(sed -n 's/^renderDistance://p' "$INSTANCE_OPTIONS" 2>/dev/null | head -n1)/sim $(sed -n 's/^simulationDistance://p' "$INSTANCE_OPTIONS" 2>/dev/null | head -n1)."
 case "$GL_RENDERER_LINE" in
   *softpipe*)
     echo "WARNING: Mesa is on softpipe, which is several times slower than llvmpipe. Check that libgl1-mesa-dri is installed; GALLIUM_DRIVER=llvmpipe forces the fast rasteriser."
