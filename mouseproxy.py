@@ -3,11 +3,19 @@
 
 These requests arrive here:
 
-    GET  /...             noVNC's files, including our index.html
-    GET  /websockify      (Upgrade: websocket) relayed byte for byte to websockify
-    POST /cloudpc/mouse   {"dx":..,"dy":..} moved through XTEST as *relative* motion
-    GET  /cloudpc/stream  the stream size, the screen size, whether the game is up
-    POST /cloudpc/stream  {"scale":40..100} resize the stream and the game window
+    GET  /...                  noVNC's files, including our index.html
+    GET  /websockify           (Upgrade: websocket) relayed byte for byte to websockify
+    GET  /cloudpc/mouse?dx=..  moved through XTEST as *relative* motion
+    GET  /cloudpc/stream       the stream size, the screen size, whether the game is up
+    GET  /cloudpc/stream?scale=..  resize the stream and the game window
+
+The two control endpoints take their arguments in the query string and are plain
+GETs on purpose. They used to be POSTs with a JSON body and an X-CloudPC header, and
+that broke in front of a gateway: an app behind one of those is a proxy in the
+middle, and a proxy is free to refuse a method it does not route (501) or to rewrite
+the Host header, which the old same-origin check compared against Origin (403). A GET
+with no custom header is what the proxy already carries for every file of this page,
+and the token below is what keeps it ours. POST still works for an older page.
 
 The last one is what makes mouse look work. RFB carries absolute pointer positions
 only, so a look update always had to be "a point on the desktop". But Minecraft does
@@ -33,13 +41,14 @@ import ctypes.util
 import json
 import mimetypes
 import os
+import secrets
 import socket
 import subprocess
 import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import unquote, urlsplit
+from urllib.parse import parse_qs, unquote, urlsplit
 
 WEB_ROOT = os.path.abspath(os.environ.get("CLOUDPC_WEB_ROOT", "/usr/share/novnc"))
 WS_UPSTREAM = os.environ.get("CLOUDPC_WS_UPSTREAM", "127.0.0.1:8081")
@@ -47,6 +56,11 @@ DISPLAY = os.environ.get("CLOUDPC_DISPLAY", ":0")
 PORT = int(os.environ.get("NOVNC_PORT", "8080"))
 # Written by fpswatch.py: the game's own frame rate, or absent when no game is up.
 FPS_FILE = os.environ.get("CLOUDPC_FPS_FILE", "/tmp/cloudpc-fps")
+# The token the page is served with, and the only thing that lets a request steer the
+# pointer or resize the stream. It is substituted into index.html as it is served, so
+# a page on another origin cannot read it, and it changes every boot.
+TOKEN = secrets.token_urlsafe(12)
+TOKEN_MARK = "__CLOUDPC_TOKEN__"
 # A single swipe interval is a few dozen pixels; anything near this is a client bug.
 MAX_STEP = 2000
 # Look requests are cheap, but there is no reason for a page to send thousands a
@@ -335,12 +349,40 @@ class Handler(BaseHTTPRequestHandler):
 
     # ---------- reading ----------
 
+    def query(self):
+        return parse_qs(urlsplit(self.path).query)
+
     def do_GET(self):
         if self.headers.get("Upgrade", "").lower() == "websocket":
             return self.tunnel()
-        if urlsplit(self.path).path == "/cloudpc/stream":
+        path = urlsplit(self.path).path
+        if path == "/cloudpc/stream":
+            if "scale" in self.query():
+                return self.resize_stream()
             return self.reply(200, "application/json", json.dumps(stream_state()))
+        if path == "/cloudpc/mouse":
+            return self.mouse_look()
         self.serve_static()
+
+    def do_OPTIONS(self):
+        """A preflight, answered so no browser sees a 501 from this server.
+
+        The cross-origin permission is only granted to a request that already carries
+        the page's token: a page on another origin must not be able to steer this
+        desktop, and it cannot read a token it was never served.
+        """
+        token = (self.query().get("t") or [""])[0]
+        self.send_response(204)
+        self.send_header("Allow", "GET, POST, OPTIONS")
+        if token and secrets.compare_digest(token, TOKEN):
+            self.send_header("Access-Control-Allow-Origin",
+                             self.headers.get("Origin") or "*")
+            self.send_header("Access-Control-Allow-Headers", "X-CloudPC, Content-Type")
+            self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+            self.send_header("Vary", "Origin")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", "0")
+        self.end_headers()
 
     def serve_static(self):
         path = unquote(urlsplit(self.path).path)
@@ -357,6 +399,11 @@ class Handler(BaseHTTPRequestHandler):
                 body = handle.read()
         except OSError:
             return self.reply(404, "text/plain", "not found")
+        # The page carries the token that authorises its control requests. It is put
+        # in here rather than baked into the file: it changes every boot, and only a
+        # page served by this process can read it.
+        if target == os.path.join(WEB_ROOT, "index.html"):
+            body = body.replace(TOKEN_MARK.encode(), TOKEN.encode())
         kind = mimetypes.guess_type(target)[0] or "application/octet-stream"
         self.reply(200, kind, body)
 
@@ -432,17 +479,42 @@ class Handler(BaseHTTPRequestHandler):
         return self.reply(404, "text/plain", "not found")
 
     def trusted(self):
-        """Only our own page may steer the pointer or resize the stream: a custom
-        header cannot be attached by another site without a CORS preflight, which
-        this server never approves."""
+        """Only our own page may steer the pointer or resize the stream.
+
+        The page is served with a token that changes every boot, and a page on another
+        origin cannot read it, so holding it is proof that this request comes from this
+        desktop's own page. It is also the check that survives a gateway in front of
+        the container rewriting the Host header, which the old Origin/Host comparison
+        did not: that one answered 403 to the app's own requests.
+
+        A POST still needs the X-CloudPC header, which another site cannot add without
+        a preflight this server only approves for a request that already has the token.
+        """
+        token = (self.query().get("t") or [""])[0]
+        if token and secrets.compare_digest(token, TOKEN):
+            return True
         if self.headers.get("X-CloudPC") != "1":
-            self.reply(403, "text/plain", "forbidden")
+            self.reply(403, "application/json",
+                       json.dumps({"ok": False, "error": "forbidden"}))
             return False
         origin = self.headers.get("Origin")
         if origin and urlsplit(origin).netloc not in ("", self.headers.get("Host")):
-            self.reply(403, "text/plain", "forbidden")
+            self.reply(403, "application/json",
+                       json.dumps({"ok": False, "error": "forbidden"}))
             return False
         return True
+
+    def request_params(self):
+        """The arguments of a control request, from the query string or a JSON body.
+        GET is what the page sends; POST is kept for an older page."""
+        params = {}
+        if self.command == "POST":
+            body = self.json_body()
+            if isinstance(body, dict):
+                params.update(body)
+        for key, values in self.query().items():
+            params.setdefault(key, values[0])
+        return params
 
     def json_body(self):
         try:
@@ -459,11 +531,11 @@ class Handler(BaseHTTPRequestHandler):
     def mouse_look(self):
         if not self.trusted():
             return
-        body = self.json_body()
+        params = self.request_params()
         try:
-            dx = int(round(float(body.get("dx", 0))))
-            dy = int(round(float(body.get("dy", 0))))
-        except (ValueError, TypeError, AttributeError):
+            dx = int(round(float(params.get("dx", 0))))
+            dy = int(round(float(params.get("dy", 0))))
+        except (ValueError, TypeError, AttributeError, OverflowError):
             return self.reply(400, "application/json",
                               json.dumps({"ok": False, "error": "bad request"}))
 
@@ -496,11 +568,12 @@ class Handler(BaseHTTPRequestHandler):
         """
         if not self.trusted():
             return
-        body = self.json_body()
+        params = self.request_params()
         try:
-            percent = int(round(float(body.get("scale"))))
-        except (ValueError, TypeError, AttributeError):
-            return self.reply(400, "text/plain", "bad request")
+            percent = int(round(float(params.get("scale"))))
+        except (ValueError, TypeError, AttributeError, OverflowError):
+            return self.reply(400, "application/json",
+                              json.dumps({"ok": False, "error": "bad request"}))
         percent = max(MIN_SCALE, min(MAX_SCALE, percent))
         remember_scale(percent)
         width, height = stream_size(percent)

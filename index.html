@@ -5,6 +5,7 @@
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <meta name="theme-color" content="#101827">
 <meta name="color-scheme" content="dark">
+<meta name="cloudpc-token" content="__CLOUDPC_TOKEN__">
 <meta name="mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
@@ -744,6 +745,24 @@ function remotePixelsPerCssPixel() {
  * travel that has not been sent yet stays queued. */
 const LOOK_INTERVAL = 50;
 const LOOK_URL = "/cloudpc/mouse";
+
+/* The control endpoints take the token this page was served with, and they are plain
+ * GETs. Both are deliberate. They used to be POSTs with a JSON body and an X-CloudPC
+ * header, and in front of a gateway that is two ways to fail: the proxy can refuse a
+ * method it does not route (501) and it can rewrite the Host header, which the
+ * container compared against Origin and answered 403. A GET with no custom header is
+ * the same kind of request as every file of this page, so the proxy carries it; the
+ * token is what keeps it ours, because a page on another origin cannot read it. */
+const tokenTag = document.querySelector('meta[name="cloudpc-token"]');
+const CONTROL_TOKEN = (() => {
+  const value = tokenTag ? tokenTag.getAttribute("content") || "" : "";
+  return value.startsWith("__") ? "" : value;
+})();
+function controlUrl(path, params) {
+  const query = new URLSearchParams(params || {});
+  if (CONTROL_TOKEN) query.set("t", CONTROL_TOKEN);
+  return path + "?" + query.toString();
+}
 let look = null;
 let lookTimer = 0;
 let lookInFlight = false;
@@ -779,10 +798,7 @@ function sendLook(dx, dy) {
    * this failed before. The travel stays queued, so a timeout costs nothing. */
   const stop = new AbortController();
   const deadline = setTimeout(() => stop.abort(), 2000);
-  fetch(LOOK_URL, {
-    method: "POST",
-    headers: { "Content-Type": "application/json", "X-CloudPC": "1" },
-    body: JSON.stringify({ dx: stepX, dy: stepY }),
+  fetch(controlUrl(LOOK_URL, { dx: stepX, dy: stepY }), {
     cache: "no-store",
     signal: stop.signal,
   })
@@ -1244,10 +1260,8 @@ async function applyDetail(level, manual) {
   paintDetail();
   const percent = DETAIL_LEVELS[detailIndex];
   try {
-    const response = await fetch("/cloudpc/stream", {
-      method: "POST",
-      headers: { "Content-Type": "application/json", "X-CloudPC": "1" },
-      body: JSON.stringify({ scale: percent }),
+    const response = await fetch(controlUrl("/cloudpc/stream", { scale: percent }), {
+      cache: "no-store",
     });
     if (!response.ok) return;
     const state = await response.json();
