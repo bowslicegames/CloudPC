@@ -43,6 +43,8 @@ unset OFFLOAD_WIDTH OFFLOAD_HEIGHT
   'BEGIN { s = w / 800; if (h / 500 < s) s = h / 500; if (s > 1) s = 1; printf "%.2f", s }')}"
 : "${JAVA_MIN_RAM:=512M}"
 : "${JAVA_MAX_RAM:=1536M}"
+# Seconds between the per-process CPU lines in the log; see cpuwatch.py.
+: "${CPU_LOG_INTERVAL:=30}"
 # Desktop on top of X: `lite` is openbox plus the launcher (no panel, no wallpaper
 # daemon, no settings daemons), `xfce` is the full session. SESSION=xfce gets the
 # old desktop back.
@@ -62,52 +64,40 @@ export MALLOC_ARENA_MAX="${MALLOC_ARENA_MAX:-2}"
 # not from the container's CPU quota, so a ~1 CPU app ends up with dozens of
 # threads fighting over one core. Pin it to the quota, and keep the LLVM-compiled
 # shader cache on /data so Minecraft does not recompile every shader each boot.
-cgroup_cpu_limit() {
-  local quota period
+# The quota is read once, here, and every rule below works from these two numbers.
+# CPU_CORE_COUNT is how many threads' worth of work the cgroup will fund, rounded up:
+# 125% still funds a whole second thread's worth above one core. CPU_QUOTA_PERCENT is
+# the same quota as a percentage of one core, and that is what the question "is there
+# a second core to put this thread on" is actually asking. Parsing the file twice is
+# how the two answers drifted: 125% rounded to two cores, so Mesa's GL dispatch thread
+# was put on a core that does not exist.
+cgroup_cpu_quota() {
+  local quota="" period=""
   if [[ -r /sys/fs/cgroup/cpu.max ]]; then
     read -r quota period < /sys/fs/cgroup/cpu.max || true
-    if [[ "$quota" =~ ^[0-9]+$ ]] && [[ "${period:-0}" =~ ^[0-9]+$ ]] && (( period > 0 )); then
-      echo $(( (quota + period - 1) / period ))
-      return 0
+  fi
+  if [[ ! "$quota" =~ ^[0-9]+$ ]]; then
+    # v2 has no numeric quota ("max"), or there is no v2 file at all.
+    quota="" period=""
+    if [[ -r /sys/fs/cgroup/cpu/cpu.cfs_quota_us && -r /sys/fs/cgroup/cpu/cpu.cfs_period_us ]]; then
+      read -r quota < /sys/fs/cgroup/cpu/cpu.cfs_quota_us || true
+      read -r period < /sys/fs/cgroup/cpu/cpu.cfs_period_us || true
     fi
   fi
-  if [[ -r /sys/fs/cgroup/cpu/cpu.cfs_quota_us && -r /sys/fs/cgroup/cpu/cpu.cfs_period_us ]]; then
-    read -r quota < /sys/fs/cgroup/cpu/cpu.cfs_quota_us || true
-    read -r period < /sys/fs/cgroup/cpu/cpu.cfs_period_us || true
-    if [[ "$quota" =~ ^[0-9]+$ ]] && [[ "${period:-0}" =~ ^[0-9]+$ ]] && (( period > 0 )) && (( quota > 0 )); then
-      echo $(( (quota + period - 1) / period ))
-      return 0
-    fi
+  if [[ "$quota" =~ ^[0-9]+$ ]] && (( quota > 0 )) \
+     && [[ "${period:-0}" =~ ^[0-9]+$ ]] && (( period > 0 )); then
+    CPU_QUOTA_PERCENT=$(( quota * 100 / period ))
+    if (( CPU_QUOTA_PERCENT < 1 )); then CPU_QUOTA_PERCENT=1; fi
+    CPU_CORE_COUNT=$(( (quota + period - 1) / period ))
+    return 0
   fi
-  nproc
+  # No quota: the whole host, which is also what llvmpipe would have assumed.
+  CPU_CORE_COUNT="$(nproc)"
+  CPU_QUOTA_PERCENT=$(( CPU_CORE_COUNT * 100 ))
 }
+cgroup_cpu_quota
 
-# The same quota as a percentage of one core, which is the number the rules below
-# actually care about. cgroup_cpu_limit() rounds up, because a container given 1.25
-# cores still gets to run a whole extra thread's worth above one core. That rounding
-# is wrong for deciding whether there is a *second core*: 125% is not 200%, and a
-# thread placed on the difference gets scheduled against the game's own threads.
-cgroup_cpu_percent() {
-  local quota period
-  if [[ -r /sys/fs/cgroup/cpu.max ]]; then
-    read -r quota period < /sys/fs/cgroup/cpu.max || true
-    if [[ "$quota" =~ ^[0-9]+$ ]] && [[ "${period:-0}" =~ ^[0-9]+$ ]] && (( period > 0 )); then
-      echo $(( quota * 100 / period ))
-      return 0
-    fi
-  fi
-  if [[ -r /sys/fs/cgroup/cpu/cpu.cfs_quota_us && -r /sys/fs/cgroup/cpu/cpu.cfs_period_us ]]; then
-    read -r quota < /sys/fs/cgroup/cpu/cpu.cfs_quota_us || true
-    read -r period < /sys/fs/cgroup/cpu/cpu.cfs_period_us || true
-    if [[ "$quota" =~ ^[0-9]+$ ]] && [[ "${period:-0}" =~ ^[0-9]+$ ]] && (( period > 0 )) && (( quota > 0 )); then
-      echo $(( quota * 100 / period ))
-      return 0
-    fi
-  fi
-  echo $(( $(nproc) * 100 ))
-}
-
-LP_NUM_THREADS="${LP_NUM_THREADS:-$(cgroup_cpu_limit)}"
+LP_NUM_THREADS="${LP_NUM_THREADS:-$CPU_CORE_COUNT}"
 if ! [[ "${LP_NUM_THREADS:-}" =~ ^[1-9][0-9]*$ ]]; then
   LP_NUM_THREADS=1
 fi
@@ -138,19 +128,18 @@ fi
 # threads — which is right, those threads share the whole quota while the render thread
 # is blocked in a draw — but it is not a second core for a thread that has to run
 # *alongside* the game. GLTHREAD=1 forces it on and GLTHREAD=0 forces it off.
-CPU_PERCENT="$(cgroup_cpu_percent)"
 GLTHREAD="${GLTHREAD:-auto}"
 if [[ "$GLTHREAD" == "auto" ]]; then
-  if (( CPU_PERCENT >= 175 )); then GLTHREAD=1; else GLTHREAD=0; fi
+  if (( CPU_QUOTA_PERCENT >= 175 )); then GLTHREAD=1; else GLTHREAD=0; fi
 fi
 if [[ "$GLTHREAD" == "1" ]]; then
   export mesa_glthread=true
   echo "CloudPC: Mesa threaded GL dispatch on (GLTHREAD=1)."
 else
-  echo "CloudPC: Mesa threaded GL dispatch off: ${CPU_PERCENT}% of a core is not a second core to put it on (GLTHREAD=1 forces it on)."
+  echo "CloudPC: Mesa threaded GL dispatch off: ${CPU_QUOTA_PERCENT}% of a core is not a second core to put it on (GLTHREAD=1 forces it on)."
 fi
 
-CPU_BUDGET="$(cgroup_cpu_limit)"
+CPU_BUDGET="$CPU_CORE_COUNT"
 
 # ---------------------------------------------------------------------------
 # The stream is a rectangle
@@ -632,7 +621,7 @@ fi
 # desktop can be diagnosed from the log instead of guessed at. nproc is what the
 # host reports, which is why llvmpipe needs the cgroup quota instead of it.
 read -r STREAM_WIDTH STREAM_HEIGHT < <(stream_size)
-echo "CloudPC: performance -- ${CPU_BUDGET} CPU core(s) allowed (quota ${CPU_PERCENT}%, nproc $(nproc)), llvmpipe ${LP_NUM_THREADS} thread(s), framebuffer ${SCREEN_WIDTH}x${SCREEN_HEIGHT} (PIXEL_OFFLOAD=${PIXEL_OFFLOAD:-0}, UI scale ${UI_SCALE}), stream ${STREAM_WIDTH}x${STREAM_HEIGHT} at $(stream_scale)% of it, ${VNC_WAIT}/${VNC_DEFER} ms, Minecraft on Serial GC with ${JAVA_CPUS} core(s), view $(sed -n 's/^renderDistance://p' "$INSTANCE_OPTIONS" 2>/dev/null | head -n1)/sim $(sed -n 's/^simulationDistance://p' "$INSTANCE_OPTIONS" 2>/dev/null | head -n1)."
+echo "CloudPC: performance -- ${CPU_BUDGET} CPU core(s) allowed (quota ${CPU_QUOTA_PERCENT}%, nproc $(nproc)), llvmpipe ${LP_NUM_THREADS} thread(s), framebuffer ${SCREEN_WIDTH}x${SCREEN_HEIGHT} (PIXEL_OFFLOAD=${PIXEL_OFFLOAD:-0}, UI scale ${UI_SCALE}), stream ${STREAM_WIDTH}x${STREAM_HEIGHT} at $(stream_scale)% of it, ${VNC_WAIT}/${VNC_DEFER} ms, Minecraft on Serial GC with ${JAVA_CPUS} core(s), view $(sed -n 's/^renderDistance://p' "$INSTANCE_OPTIONS" 2>/dev/null | head -n1)/sim $(sed -n 's/^simulationDistance://p' "$INSTANCE_OPTIONS" 2>/dev/null | head -n1)."
 case "$GL_RENDERER_LINE" in
   *softpipe*)
     echo "WARNING: Mesa is on softpipe, which is several times slower than llvmpipe. Check that libgl1-mesa-dri is installed; GALLIUM_DRIVER=llvmpipe forces the fast rasteriser."
@@ -1094,6 +1083,13 @@ if [[ "$WS_READY" != "1" ]]; then
   ps aux | grep '[w]ebsockify' || true
   exit 1
 fi
+
+# Which process is spending the quota. The performance line says what the budget is;
+# this says who takes it, because llvmpipe lives inside the JVM and "the game is slow"
+# and "the rasteriser is slow" need different fixes. Niced all the way down: a sampler
+# that competes with the thing it measures is worse than no sampler.
+CLOUDPC_CPU_PERCENT="$CPU_QUOTA_PERCENT" CPU_LOG_INTERVAL="$CPU_LOG_INTERVAL" \
+  nice -n 19 python3 /opt/cloudpc/cpuwatch.py &
 
 echo "CloudPC: starting noVNC and relative mouse on 0.0.0.0:${NOVNC_PORT}..."
 runuser -u cloud -- env HOME=/home/cloud DISPLAY=:0 \

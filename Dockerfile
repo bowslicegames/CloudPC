@@ -42,6 +42,7 @@ COPY entrypoint.sh /opt/cloudpc/entrypoint.sh
 COPY healthcheck.sh /opt/cloudpc/healthcheck.sh
 COPY mouseproxy.py /opt/cloudpc/mouseproxy.py
 COPY fpswatch.py /opt/cloudpc/fpswatch.py
+COPY cpuwatch.py /opt/cloudpc/cpuwatch.py
 COPY dbus-session.conf /opt/cloudpc/dbus-session.conf
 COPY prism/ /opt/cloudpc/prism/
 COPY etc/xdg/xfce4/xfconf/xfce-perchannel-xml/ /etc/xdg/xfce4/xfconf/xfce-perchannel-xml/
@@ -88,7 +89,7 @@ RUN version="$(curl -fsS --max-time 25 https://launchermeta.mojang.com/mc/game/v
  && python3 -c 'import json,sys; path="/opt/cloudpc/prism/instance/mmc-pack.json"; data=json.load(open(path)); data["components"][0]["version"]=sys.argv[1]; json.dump(data, open(path, "w"), indent=2)' "$version" \
  && echo "CloudPC: Prism instance pinned to Minecraft ${version}"
 
-RUN chmod +x /opt/cloudpc/entrypoint.sh /opt/cloudpc/healthcheck.sh /opt/cloudpc/mouseproxy.py /opt/cloudpc/fpswatch.py \
+RUN chmod +x /opt/cloudpc/entrypoint.sh /opt/cloudpc/healthcheck.sh /opt/cloudpc/mouseproxy.py /opt/cloudpc/fpswatch.py /opt/cloudpc/cpuwatch.py \
  && rm -f /usr/share/novnc/vnc.html /usr/share/novnc/vnc_lite.html
 
 EXPOSE 8080
