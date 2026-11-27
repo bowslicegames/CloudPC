@@ -181,6 +181,58 @@ fi
 CPU_BUDGET="$CPU_CORE_COUNT"
 
 # ---------------------------------------------------------------------------
+# The JVM heap is sized from the container's memory, not from a fixed number
+#
+# Minecraft's process is more than its Java heap: metaspace, the code cache, GC
+# structures, thread stacks, LWJGL and NeoForge's native buffers, and Mesa's
+# llvmpipe framebuffers all live outside it, and Xvfb, x11vnc, websockify and
+# Prism live outside the JVM. So the heap ceiling is a share of the cgroup's
+# memory limit with room left for everything else, not the whole allocation.
+# The app platforms enforce RAM with that limit; without one there is nothing to
+# size against and the shipped heap stays. A sentinel-sized "unlimited" value is
+# ignored the same way.
+MEM_LIMIT_MB=0
+cgroup_memory_limit_mb() {
+  local bytes=""
+  if [[ -r /sys/fs/cgroup/memory.max ]]; then
+    read -r bytes < /sys/fs/cgroup/memory.max || true
+  fi
+  if [[ ! "$bytes" =~ ^[0-9]+$ ]]; then
+    # v2 with no numeric limit ("max"), or no v2 file at all.
+    bytes=""
+    if [[ -r /sys/fs/cgroup/memory/memory.limit_in_bytes ]]; then
+      read -r bytes < /sys/fs/cgroup/memory/memory.limit_in_bytes || true
+    fi
+  fi
+  [[ "$bytes" =~ ^[0-9]+$ ]] || return 0
+  # v1 reports "unlimited" as a huge sentinel near 2^63; anything above a
+  # petabyte is no limit at all, and anything below 64 MiB is not a session.
+  if (( bytes < 67108864 || bytes > 1125899906842624 )); then return 0; fi
+  MEM_LIMIT_MB=$(( bytes / 1048576 ))
+}
+cgroup_memory_limit_mb
+
+# Two thirds of the limit, rounded down to a whole 256 MiB, capped at 4096. The
+# documented 4 GB floor lands exactly on the 2560 MiB this image used to hard-code;
+# 6 GB lands on 4096 MiB; more than that does not need any more heap for this scene.
+# The starting heap stays modest: growth is cheap, and a young generation sized for
+# a heap that is never filled only makes Serial's pauses longer.
+HEAP_MAX_MB=2560
+HEAP_MIN_MB=1024
+if (( MEM_LIMIT_MB > 0 )); then
+  HEAP_MAX_MB=$(( MEM_LIMIT_MB * 2 / 3 / 256 * 256 ))
+  if (( HEAP_MAX_MB > 4096 )); then HEAP_MAX_MB=4096; fi
+  if (( HEAP_MAX_MB < 1024 )); then HEAP_MAX_MB=1024; fi
+  if (( HEAP_MAX_MB >= 4096 )); then HEAP_MIN_MB=2048; fi
+  if (( HEAP_MIN_MB > HEAP_MAX_MB / 2 )); then HEAP_MIN_MB=$(( HEAP_MAX_MB / 2 )); fi
+  MEM_LIMIT_LABEL="${MEM_LIMIT_MB} MiB"
+  echo "CloudPC: ${MEM_LIMIT_MB} MiB of container memory -- Minecraft heap ${HEAP_MIN_MB}-${HEAP_MAX_MB} MiB, the rest is for the JVM's native memory and the session."
+else
+  MEM_LIMIT_LABEL="no cgroup limit"
+  echo "CloudPC: no cgroup memory limit visible -- keeping the shipped Minecraft heap ${HEAP_MIN_MB}-${HEAP_MAX_MB} MiB."
+fi
+
+# ---------------------------------------------------------------------------
 # The stream is a rectangle
 #
 # Every stage between the game and the device costs the same number of pixels, and
@@ -331,9 +383,27 @@ set_instance_default() {
     echo "CloudPC: instance default ${key} ${from} -> ${to}"
   fi
 }
-# 1.21.x with mods needs more heap than 1.5 GiB.
-set_instance_default MinMemAlloc 512 1024
-set_instance_default MaxMemAlloc 1536 2560
+# The heap was sized above from the container's memory limit. Only values this
+# image shipped are moved: 512/1024/2048 MiB for the minimum and 1536/2560 MiB for
+# the maximum. A number picked in Prism is left alone, the same rule as the JVM
+# arguments; 4096 is deliberately not in the list because the README suggests it
+# as a manual choice, so a heap the user set must stay where it is.
+set_instance_heap() {
+  local key="$1" value="$2" current allowed
+  [[ -f "$INSTANCE_CFG" ]] || return 0
+  current="$(sed -n "s/^${key}=//p" "$INSTANCE_CFG" | tail -n 1)"
+  [[ -n "$current" && "$current" != "$value" ]] || return 0
+  case "$key" in
+    MinMemAlloc) allowed=" 512 1024 2048 " ;;
+    MaxMemAlloc) allowed=" 1536 2560 " ;;
+    *) return 0 ;;
+  esac
+  [[ "$allowed" == *" $current "* ]] || return 0
+  sed -i "s/^${key}=${current}\$/${key}=${value}/" "$INSTANCE_CFG"
+  echo "CloudPC: instance heap ${key} ${current} -> ${value} MiB"
+}
+set_instance_heap MinMemAlloc "$HEAP_MIN_MB"
+set_instance_heap MaxMemAlloc "$HEAP_MAX_MB"
 # The desktop is 800x500: every pixel is shaded on the CPU and then encoded for
 # the browser, which upscales the stream to the device. That is 61% of the pixels of
 # the old 1024x640 desktop, at the same 16:10 shape, so nothing has to be re-laid-out.
@@ -689,7 +759,7 @@ fi
 # container may run on, not what the cgroup will fund, which is why llvmpipe's worker
 # count comes from the budget and not from nproc alone.
 read -r STREAM_WIDTH STREAM_HEIGHT < <(stream_size)
-echo "CloudPC: performance -- ${CPU_BUDGET} CPU core(s) allowed (quota ${CPU_QUOTA_PERCENT}%${CPU_PERIOD_MS:+ over a ${CPU_PERIOD_MS} ms period}, nproc $(nproc)), llvmpipe ${LP_NUM_THREADS} thread(s), framebuffer ${SCREEN_WIDTH}x${SCREEN_HEIGHT} (PIXEL_OFFLOAD=${PIXEL_OFFLOAD:-0}, UI scale ${UI_SCALE}), stream ${STREAM_WIDTH}x${STREAM_HEIGHT} at $(stream_scale)% of it, ${VNC_WAIT}/${VNC_DEFER} ms, Minecraft on ${GC_NAME} with ${JAVA_CPUS} core(s), view $(sed -n 's/^renderDistance://p' "$INSTANCE_OPTIONS" 2>/dev/null | head -n1)/sim $(sed -n 's/^simulationDistance://p' "$INSTANCE_OPTIONS" 2>/dev/null | head -n1)."
+echo "CloudPC: performance -- ${CPU_BUDGET} CPU core(s) allowed (quota ${CPU_QUOTA_PERCENT}%${CPU_PERIOD_MS:+ over a ${CPU_PERIOD_MS} ms period}, nproc $(nproc)), llvmpipe ${LP_NUM_THREADS} thread(s), framebuffer ${SCREEN_WIDTH}x${SCREEN_HEIGHT} (PIXEL_OFFLOAD=${PIXEL_OFFLOAD:-0}, UI scale ${UI_SCALE}), stream ${STREAM_WIDTH}x${STREAM_HEIGHT} at $(stream_scale)% of it, ${VNC_WAIT}/${VNC_DEFER} ms, Minecraft on ${GC_NAME} with ${JAVA_CPUS} core(s), heap ${HEAP_MIN_MB}-${HEAP_MAX_MB} MiB of ${MEM_LIMIT_LABEL} RAM, view $(sed -n 's/^renderDistance://p' "$INSTANCE_OPTIONS" 2>/dev/null | head -n1)/sim $(sed -n 's/^simulationDistance://p' "$INSTANCE_OPTIONS" 2>/dev/null | head -n1)."
 case "$GL_RENDERER_LINE" in
   *softpipe*)
     echo "WARNING: Mesa is on softpipe, which is several times slower than llvmpipe. Check that libgl1-mesa-dri is installed; GALLIUM_DRIVER=llvmpipe forces the fast rasteriser."
