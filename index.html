@@ -1218,7 +1218,13 @@ streamBtn.addEventListener("click", () => {
 const DETAIL_KEY = "cloudpc.detail";
 const DETAIL_LEVELS = [100, 80, 62, 50, 40, 30];
 const DETAIL_NAMES = ["Full", "Large", "Medium", "Small", "Tiny", "Minimal"];
-const DETAIL_TARGET = 20;
+/* What Auto aims the picture at. Twenty was the aim when the container had one core
+ * and every frame was fought for; at three it leaves frames on the table, and Auto
+ * that settles for twenty looks broken next to a game that holds thirty. Auto steps
+ * down under 85% of this and back up once the rate reaches it, so the band is four
+ * frames wide rather than the old eleven — a machine sitting between the old two
+ * thresholds could never climb out, and stayed wherever it had fallen. */
+const DETAIL_TARGET = 25;
 let detailAuto = true;
 let detailIndex = 1;
 let detailSynced = false;
@@ -1246,9 +1252,11 @@ function paintDetail() {
   detailBtn.textContent = detailAuto ? "Auto " + percent + "%" : DETAIL_NAMES[detailIndex];
   detailBtn.title = detailAuto
     ? "Picture detail: Auto, aiming for " + DETAIL_TARGET + " fps at " + percent +
-      "% of the desktop. Tap to cut detail for more frames."
-    : "Picture detail: " + percent + "% of the desktop, " + DETAIL_NAMES[detailIndex] +
-      ". Tap to trade more detail for more frames.";
+      "% of the desktop. Tap to take it off Auto, at full size."
+    : "Picture detail: " + DETAIL_NAMES[detailIndex] + ", " + percent +
+      "% of the desktop." + (detailIndex < DETAIL_LEVELS.length - 1
+        ? " Tap for less detail and more frames."
+        : " Tap to hand the picture back to Auto.");
   detailBtn.setAttribute("aria-pressed", detailAuto ? "false" : "true");
 }
 
@@ -1286,9 +1294,16 @@ async function applyDetail(level, manual) {
   } catch { /* the next poll reports where we are */ }
 }
 
-/* One control, one direction: tap repeatedly to spend detail on frames, and the
- * last tap hands the choice back to Auto. */
+/* One control, every state: Auto, then full size, then a step down per tap, then
+ * Auto again. The first tap out of Auto goes to full detail, which is the level the
+ * old cycle could not reach — it started at 80% and only went down, so a player whose
+ * Auto had settled on 30% had no way to ask for the picture back, and two taps later
+ * was back in Auto. A tap is now a definite choice, held until the next one. */
 detailBtn?.addEventListener("click", () => {
+  if (detailAuto) {
+    applyDetail(0, true);
+    return;
+  }
   if (detailIndex < DETAIL_LEVELS.length - 1) {
     applyDetail(detailIndex + 1, true);
     return;
@@ -1339,7 +1354,7 @@ function governFps() {
   if (fps < DETAIL_TARGET * 0.85) {
     detailSlow += 1;
     detailFast = 0;
-  } else if (fps >= DETAIL_TARGET * 1.4 && streamFps >= 10) {
+  } else if (fps >= DETAIL_TARGET && streamFps >= 10) {
     /* Spend detail again only on a picture the stream can actually carry: a paused
      * or loading game draws quickly, and a stream that is only delivering a dozen
      * updates would spend the detail and hand it straight back. */
@@ -1351,7 +1366,7 @@ function governFps() {
   }
   if (detailSlow >= 5 && detailIndex < DETAIL_LEVELS.length - 1) {
     applyDetail(detailIndex + 1, false);
-  } else if (detailFast >= 10 && detailIndex > 0) {
+  } else if (detailFast >= 6 && detailIndex > 0) {
     applyDetail(detailIndex - 1, false);
   }
 }
