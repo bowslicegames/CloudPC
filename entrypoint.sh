@@ -77,6 +77,7 @@ unset OFFLOAD_WIDTH OFFLOAD_HEIGHT
 # dispatch thread was put on a core that does not exist.
 CPU_QUOTA_UNSPENDABLE=0
 CPU_QUOTA_CORES=""
+CPU_PERIOD_MS=""
 cgroup_cpu_quota() {
   local quota="" period=""
   # Which CPUs the container may run on at all, quota or not. sched_getaffinity is
@@ -99,6 +100,11 @@ cgroup_cpu_quota() {
      && [[ "${period:-0}" =~ ^[0-9]+$ ]] && (( period > 0 )); then
     CPU_QUOTA_PERCENT=$(( quota * 100 / period ))
     if (( CPU_QUOTA_PERCENT < 1 )); then CPU_QUOTA_PERCENT=1; fi
+    # The period is the other half of the quota: a container is frozen for the rest
+    # of its period when it spends the quota, so a long period turns an over-budget
+    # session into long freezes rather than short stutters. It is in the log so that
+    # "smooth, then frozen, repeating" can be told apart from a game-side stall.
+    CPU_PERIOD_MS=$(( period / 1000 ))
     CPU_QUOTA_CORES=$(( (quota + period - 1) / period ))
     CPU_CORE_COUNT="$CPU_QUOTA_CORES"
     # Quota above the allowed CPU set cannot be spent. This is the difference
@@ -243,14 +249,17 @@ stream_size() {
 # one or two cores the encoder is a rival for the core the game renders on: full size
 # keeps 46 ms, and a stream at 640x400 or below, four times less to read and encode,
 # gets 28. At three cores that rivalry is gone, because the render thread and the
-# raster workers run while x11vnc looks, so the poll drops to its floor: 2 ms between
-# looks still leaves every wakeup a timeout rather than a spin, and 3 ms of defer is
-# enough to put the handful of rectangles one frame produces into a single encode.
-# That is 5 ms of the picture's age instead of 10, and on a 20 fps game it hands a
-# tenth of a frame back to the player every single frame.
+# raster workers run while x11vnc looks, so the poll is at its floor: 4 ms between
+# looks, 6 ms of defer to put one frame's rectangles into a single encode.
+# It went to 2/3 for one build and is back: damage arrives once per game frame, so a
+# shorter poll does not make frames arrive sooner — it splits each one into more,
+# smaller encodes, which is more bytes for the same picture, and a link that falls
+# behind the encoder freezes the display while the socket drains. 4/6 is the smallest
+# pair that has actually run smoothly on a tablet, and it is already half the 10/18
+# this started at.
 if (( CPU_BUDGET >= 3 )); then
-  : "${VNC_WAIT:=2}"
-  : "${VNC_DEFER:=3}"
+  : "${VNC_WAIT:=4}"
+  : "${VNC_DEFER:=6}"
 elif (( $(stream_scale) <= 80 )); then
   : "${VNC_WAIT:=12}"
   : "${VNC_DEFER:=16}"
@@ -338,13 +347,18 @@ set_instance_default MinecraftWinHeight 450 500
 # barrier are all extra work that has to be squeezed into the core the game is
 # drawing on. Below about two cores a stop-the-world Serial GC is faster: one
 # collection pass, no background threads, a pointer-bump allocator and no barrier.
-# At three cores the trade goes the other way. A Serial collection stops the render
-# thread for tens of milliseconds on a 2.5 GiB NeoForge heap, and that stall is the
-# input delay a player actually feels: the same thread reads the mouse, and it reads
-# nothing while the heap is being collected. G1 with a 10 ms pause target and two
-# collection workers collects on the other cores, keeps the pause in single digits,
-# and is the one part of the official client that is genuinely multi-threaded. The
-# remaining flags are container wins: stop writing the perf counters through a
+# G1 was tried at three cores — a 10 ms pause target and two collection workers, to
+# keep the pause on the thread that reads input in single digits — and it is not
+# worth it here. On a 2.5 GiB NeoForge heap that allocates faster than a quota-bound
+# container can fund the collection, the collector becomes the stall: the session
+# ran smoothly for about half a second and then froze for about half a second, which
+# is G1 falling behind its own allocation rate and repeatedly catching up. Serial's
+# young pauses are shorter at this heap size than they look, and, more importantly,
+# they are bounded — the collector can never end up competing with the rasteriser
+# for the quota for hundreds of milliseconds at a time. So the client stays on
+# Serial GC at every size, and the extra cores go to the rasteriser and the game's
+# own background pools instead (see ActiveProcessorCount below).
+# The remaining flags are container wins: stop writing the perf counters through a
 # memory-mapped file, and cap the JIT compilers at two so a host with dozens of
 # cores cannot fill this container with compiler threads.
 # The JVM sizes every pool it has from the host's core count, not from the cgroup
@@ -358,13 +372,8 @@ set_instance_default MinecraftWinHeight 450 500
 JAVA_CPUS="$CPU_BUDGET"
 if (( JAVA_CPUS < 1 )); then JAVA_CPUS=1; fi
 if (( JAVA_CPUS > 16 )); then JAVA_CPUS=16; fi
-if (( CPU_BUDGET >= 3 )); then
-  GC_NAME="G1"
-  CLOUDPC_JVM_ARGS="-XX:+UseG1GC -XX:MaxGCPauseMillis=10 -XX:ParallelGCThreads=2 -XX:ConcGCThreads=1 -XX:+PerfDisableSharedMem -XX:CICompilerCount=2 -XX:ActiveProcessorCount=${JAVA_CPUS}"
-else
-  GC_NAME="Serial GC"
-  CLOUDPC_JVM_ARGS="-XX:+UseSerialGC -XX:+PerfDisableSharedMem -XX:CICompilerCount=2 -XX:ActiveProcessorCount=${JAVA_CPUS}"
-fi
+GC_NAME="Serial GC"
+CLOUDPC_JVM_ARGS="-XX:+UseSerialGC -XX:+PerfDisableSharedMem -XX:CICompilerCount=2 -XX:ActiveProcessorCount=${JAVA_CPUS}"
 
 # Prism records "use the defaults" as OverrideJavaArgs=false, so that is the only
 # state that gets taken over. After that the args are ours until someone types their
@@ -382,8 +391,9 @@ prism_jvm_args() {
     return 1
   fi
   current="$(sed -n 's/^JvmArgs=//p' "$cfg" | tail -n 1)"
-  # Ours is either preset: Serial below three cores, G1 at three and up. A value the
-  # user typed themselves is recognised by starting with neither collector flag.
+  # Ours is either preset: the Serial one this build writes, or the G1 one the build
+  # before it wrote, which has to be moved back. A value the user typed themselves is
+  # recognised by starting with neither collector flag.
   if [[ -n "$current" && "$current" != -XX:+UseSerialGC* && "$current" != -XX:+UseG1GC* ]]; then
     return 1
   fi
@@ -679,7 +689,7 @@ fi
 # container may run on, not what the cgroup will fund, which is why llvmpipe's worker
 # count comes from the budget and not from nproc alone.
 read -r STREAM_WIDTH STREAM_HEIGHT < <(stream_size)
-echo "CloudPC: performance -- ${CPU_BUDGET} CPU core(s) allowed (quota ${CPU_QUOTA_PERCENT}%, nproc $(nproc)), llvmpipe ${LP_NUM_THREADS} thread(s), framebuffer ${SCREEN_WIDTH}x${SCREEN_HEIGHT} (PIXEL_OFFLOAD=${PIXEL_OFFLOAD:-0}, UI scale ${UI_SCALE}), stream ${STREAM_WIDTH}x${STREAM_HEIGHT} at $(stream_scale)% of it, ${VNC_WAIT}/${VNC_DEFER} ms, Minecraft on ${GC_NAME} with ${JAVA_CPUS} core(s), view $(sed -n 's/^renderDistance://p' "$INSTANCE_OPTIONS" 2>/dev/null | head -n1)/sim $(sed -n 's/^simulationDistance://p' "$INSTANCE_OPTIONS" 2>/dev/null | head -n1)."
+echo "CloudPC: performance -- ${CPU_BUDGET} CPU core(s) allowed (quota ${CPU_QUOTA_PERCENT}%${CPU_PERIOD_MS:+ over a ${CPU_PERIOD_MS} ms period}, nproc $(nproc)), llvmpipe ${LP_NUM_THREADS} thread(s), framebuffer ${SCREEN_WIDTH}x${SCREEN_HEIGHT} (PIXEL_OFFLOAD=${PIXEL_OFFLOAD:-0}, UI scale ${UI_SCALE}), stream ${STREAM_WIDTH}x${STREAM_HEIGHT} at $(stream_scale)% of it, ${VNC_WAIT}/${VNC_DEFER} ms, Minecraft on ${GC_NAME} with ${JAVA_CPUS} core(s), view $(sed -n 's/^renderDistance://p' "$INSTANCE_OPTIONS" 2>/dev/null | head -n1)/sim $(sed -n 's/^simulationDistance://p' "$INSTANCE_OPTIONS" 2>/dev/null | head -n1)."
 case "$GL_RENDERER_LINE" in
   *softpipe*)
     echo "WARNING: Mesa is on softpipe, which is several times slower than llvmpipe. Check that libgl1-mesa-dri is installed; GALLIUM_DRIVER=llvmpipe forces the fast rasteriser."

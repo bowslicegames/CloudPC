@@ -194,14 +194,14 @@ def set_clip(width, height, percent=None):
     updates a second. Both are remote-control parameters too.
 
     The boot sets the same pair (entrypoint.sh, "The stream's own timing"). At three
-    cores it does not depend on the size — the pair is down at its 2/3 ms floor — so
+    cores it does not depend on the size — the pair is down at its 4/6 ms floor — so
     the rule is only restated here for the size half of it, which is the half that
     can change after boot."""
     result = run(["x11vnc", "-R", "clip:%dx%d+0+0" % (width, height)], timeout=8)
     applied = result is not None and result.returncode == 0
     if percent is not None:
         if CPU_CORES >= 3:
-            wait, defer = 2, 3
+            wait, defer = 4, 6
         else:
             wait, defer = (12, 16) if percent <= 80 else (16, 30)
         run(["x11vnc", "-R", "wait:%d" % wait], timeout=6)
