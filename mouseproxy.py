@@ -177,6 +177,12 @@ def game_window():
         return None
 
 
+try:
+    CPU_CORES = int(os.environ.get("CLOUDPC_CPU_CORES", "1") or 1)
+except ValueError:
+    CPU_CORES = 1
+
+
 def set_clip(width, height, percent=None):
     """Ask the running x11vnc for a framebuffer rectangle through its remote-control
     channel (an X property, not a new connection). The session keeps its client: the
@@ -185,14 +191,35 @@ def set_clip(width, height, percent=None):
     The poll cadence comes with it. It is the encoder's batching, and it is what caps
     the stream when nothing else does: a quarter of the pixels is cheap enough to ship
     every 28 ms instead of every 46, so a smaller stream is not still held at twenty
-    updates a second. Both are remote-control parameters too."""
+    updates a second. Both are remote-control parameters too.
+
+    The boot sets the same pair (entrypoint.sh, "The stream's own timing"). At three
+    cores it does not depend on the size, so the rule is only restated here for the
+    size half of it, which is the half that can change after boot."""
     result = run(["x11vnc", "-R", "clip:%dx%d+0+0" % (width, height)], timeout=8)
     applied = result is not None and result.returncode == 0
     if percent is not None:
-        wait, defer = (12, 16) if percent <= 80 else (16, 30)
+        if CPU_CORES >= 3:
+            wait, defer = 4, 6
+        else:
+            wait, defer = (12, 16) if percent <= 80 else (16, 30)
         run(["x11vnc", "-R", "wait:%d" % wait], timeout=6)
         run(["x11vnc", "-R", "defer:%d" % defer], timeout=6)
     return applied
+
+
+def fps_cap():
+    """The frame limit the game's own settings impose, as the counter reports it.
+
+    The page needs it to aim Auto: a target above the cap is unreachable, and Auto that
+    can never be satisfied reads a correctly running game as slow and shrinks the
+    picture for nothing.
+    """
+    try:
+        with open(FPS_FILE + ".status", encoding="utf-8") as handle:
+            return int(json.load(handle).get("cap") or 0)
+    except (OSError, ValueError, TypeError, AttributeError):
+        return 0
 
 
 def stream_state():
@@ -203,7 +230,7 @@ def stream_state():
     return {"scale": percent, "width": width, "height": height,
             "screen": [SCREEN_WIDTH, SCREEN_HEIGHT],
             "game": window is not None or fps is not None,
-            "fps": fps, "fpsWhy": why or None}
+            "fps": fps, "fpsWhy": why or None, "fpsCap": fps_cap()}
 
 
 class Pointer:

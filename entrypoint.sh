@@ -205,17 +205,18 @@ stream_size() {
 }
 
 # The stream's own timing: how often x11vnc looks for damage, and how long it batches
-# what it found before encoding. Both halves of the delay it adds, so both move
-# together. On one or two cores the encoder is a rival for the same core the game
-# renders on: full size keeps the conservative 46 ms, and a stream at 640x400 or below
-# — four times less to read and encode — gets 28 ms. At three cores that rivalry is
-# gone, because the render thread and the raster workers can run while x11vnc looks,
-# so full size gets the short pair as well. That spends a little of the bonus on the
-# one thing the user actually feels, 18 ms of the frame's age, instead of banking CPU
-# nobody is short of.
+# what it found before encoding. Both halves are dead time for the player — the picture
+# is the only feedback the game gives — so both are as short as the budget allows. On
+# one or two cores the encoder is a rival for the core the game renders on: full size
+# keeps 46 ms, and a stream at 640x400 or below, four times less to read and encode,
+# gets 28. At three cores that rivalry is gone, because the render thread and the
+# raster workers run while x11vnc looks, so full size gets 10 ms and 18 ms of the
+# frame's age is gone. Four milliseconds is the floor rather than zero because the poll
+# is a wakeup, not an event: at zero x11vnc spins on the X connection to notice that
+# nothing happened, and takes a core to do it.
 if (( CPU_BUDGET >= 3 )); then
-  : "${VNC_WAIT:=10}"
-  : "${VNC_DEFER:=18}"
+  : "${VNC_WAIT:=4}"
+  : "${VNC_DEFER:=6}"
 elif (( $(stream_scale) <= 80 )); then
   : "${VNC_WAIT:=12}"
   : "${VNC_DEFER:=16}"
@@ -990,7 +991,7 @@ fi
 if command -v xdotool >/dev/null 2>&1; then
   rm -f "$FPS_FILE"
   runuser -u cloud -- env HOME=/home/cloud DISPLAY=:0 \
-    CLOUDPC_DISPLAY=:0 CLOUDPC_FPS_FILE="$FPS_FILE" \
+    CLOUDPC_DISPLAY=:0 CLOUDPC_FPS_FILE="$FPS_FILE" CLOUDPC_OPTIONS="$INSTANCE_OPTIONS" \
     python3 /opt/cloudpc/fpswatch.py &
   FPS_PID=$!
   if kill -0 "$FPS_PID" 2>/dev/null; then
@@ -1108,6 +1109,7 @@ runuser -u cloud -- env HOME=/home/cloud DISPLAY=:0 \
   CLOUDPC_SCREEN_HEIGHT="${SCREEN_HEIGHT}" \
   CLOUDPC_STREAM_FILE="${STREAM_FILE}" \
   CLOUDPC_FPS_FILE="${FPS_FILE}" \
+  CLOUDPC_CPU_CORES="${CPU_BUDGET}" \
   python3 /opt/cloudpc/mouseproxy.py &
 PROXY_PID=$!
 
@@ -1131,6 +1133,29 @@ if [[ "$NOVNC_READY" != "1" ]]; then
 fi
 
 echo "CloudPC: noVNC is listening on port ${NOVNC_PORT}; mouse look uses relative XTEST motion; VNC password authentication is enabled."
+
+# Prism is niced so a first launch cannot starve the stream, but the game is its child
+# and inherits that priority — which left Minecraft below Xvfb (nice 0) and level with
+# websockify, on a box where it is the one thing that has to be fast. The X server must
+# stay its equal, because the game blocks on it to present, and everything else stays
+# below. New instances are caught as they appear; a relaunch inside a session is too.
+lift_game_priority() {
+  local pid priority
+  while true; do
+    for pid in $(pgrep -u cloud -f 'net\.minecraft\.client' 2>/dev/null); do
+      priority="$(ps -o ni= -p "$pid" 2>/dev/null | tr -d ' ')"
+      if [[ -n "$priority" && "$priority" != "0" ]]; then
+        if renice -n 0 -p "$pid" >/dev/null 2>&1; then
+          echo "CloudPC: Minecraft (PID ${pid}) raised from nice ${priority} to 0; it was running below the X server."
+        fi
+      fi
+    done
+    sleep 5
+  done
+}
+if command -v renice >/dev/null 2>&1 && command -v pgrep >/dev/null 2>&1; then
+  lift_game_priority &
+fi
 
 # Supervise all core services. If one exits, report which one before shutdown.
 set +e

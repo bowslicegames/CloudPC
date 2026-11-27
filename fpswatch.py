@@ -37,6 +37,11 @@ DISPLAY = os.environ.get("CLOUDPC_DISPLAY", ":0")
 FPS_FILE = os.environ.get("CLOUDPC_FPS_FILE", "/tmp/cloudpc-fps")
 STATUS_FILE = os.environ.get("CLOUDPC_FPS_STATUS", FPS_FILE + ".status")
 GAME_TITLE = os.environ.get("CLOUDPC_GAME_TITLE", "^Minecraft")
+# Minecraft's options.txt, for the frame limit its own settings impose. Read so the
+# reading can never claim more frames than the cap allows: a count above it is this
+# counter's mistake, not the game's rate, and a player is right not to believe it.
+OPTIONS_FILE = os.environ.get("CLOUDPC_OPTIONS", "")
+CAP_POLL = 10.0
 
 # A presented frame writes the window: Minecraft clears it and draws the world into
 # it, so one frame's damage covers all of it. A HUD redraw, a tooltip or a cursor
@@ -48,9 +53,13 @@ MIN_FRAME_AREA = 2048
 # If a window's damage never reaches that share, count every damage on it instead of
 # giving up on the reading.
 LOOSE_AFTER = 4.0
-# One frame can arrive as more than one damaged rectangle; anything closer than this
-# to the last counted one belongs to the same frame. A 30 fps game presents every 33 ms.
-FRAME_GAP = 0.004
+# One frame can arrive as more than one damaged rectangle: llvmpipe reports the world
+# blit, the HUD and the present as separate writes, and on a full-size frame they can be
+# ten milliseconds apart. Anything closer than this to the last counted one belongs to
+# the same frame. Twenty milliseconds still separates real frames at any cap up to
+# 50 fps, and this instance ships capped at 30. Four milliseconds did not: a 20 fps game
+# was read as 55 because two or three of its rectangles arrived in separate wakeups.
+FRAME_GAP = 0.020
 WINDOW_POLL = 2.0
 RATE_WINDOW = 2.0
 
@@ -96,6 +105,23 @@ def game_window():
                 "height": int(values["HEIGHT"])}
     except (OSError, subprocess.SubprocessError, KeyError, ValueError):
         return None
+
+
+def frame_cap():
+    """The frame limit Minecraft's own settings impose, or 0 when it cannot be read.
+
+    options.txt carries maxFps as a whole number (260 is the slider's "Unlimited").
+    The game writes it when the setting changes, so it is a live reading, not just a
+    boot-time one.
+    """
+    try:
+        with open(OPTIONS_FILE, encoding="utf-8") as handle:
+            for line in handle:
+                if line.startswith("maxFps:"):
+                    return max(0, int(line.split(":", 1)[1].strip()))
+    except (OSError, ValueError):
+        pass
+    return 0
 
 
 def publish(value, status):
@@ -167,6 +193,9 @@ def watch():
     width = height = 0
     next_poll = 0.0
     next_publish = 0.0
+    next_cap = 0.0
+    cap = 0
+    last_capped = 0
     last_count = 0.0
     created = 0.0
     events = frames = 0
@@ -246,6 +275,17 @@ def watch():
                     rate = round((len(stamps) - 1) / (stamps[-1] - stamps[0]))
                 else:
                     rate = round(len(stamps) / RATE_WINDOW)
+            if after >= next_cap:
+                next_cap = after + CAP_POLL
+                cap = frame_cap()
+            counted = 0
+            if cap and rate > cap:
+                counted = rate
+                rate = cap
+                if counted != last_capped:
+                    print("CloudPC: counted %d damage events a second for a game limited to "
+                          "%d fps; reporting %d" % (counted, cap, rate), flush=True)
+            last_capped = counted
             why = "" if window is not None else "no game window"
             if window is not None and not rate:
                 why = "the game window is not being drawn into"
@@ -253,6 +293,8 @@ def watch():
                 "up": window is not None,
                 "fps": None if window is None else rate,
                 "why": why,
+                "cap": cap,
+                "counted": counted,
                 "window": [width, height],
                 "events": events,
                 "frames": frames,

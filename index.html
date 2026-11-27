@@ -1225,6 +1225,14 @@ const DETAIL_NAMES = ["Full", "Large", "Medium", "Small", "Tiny", "Minimal"];
  * frames wide rather than the old eleven — a machine sitting between the old two
  * thresholds could never climb out, and stayed wherever it had fallen. */
 const DETAIL_TARGET = 25;
+/* Auto cannot aim above the frame limit the game itself is set to. A 20 fps cap made
+ * the old 28 fps climb-out unreachable, and would make a 25 fps aim unreachable too:
+ * Auto would read a correctly running game as slow for ever and walk to the smallest
+ * picture. The container publishes the cap it reads from the instance's options. */
+let fpsCap = 0;
+function detailTarget() {
+  return fpsCap > 0 ? Math.min(DETAIL_TARGET, fpsCap) : DETAIL_TARGET;
+}
 let detailAuto = true;
 let detailIndex = 1;
 let detailSynced = false;
@@ -1251,7 +1259,7 @@ function paintDetail() {
   const percent = DETAIL_LEVELS[detailIndex];
   detailBtn.textContent = detailAuto ? "Auto " + percent + "%" : DETAIL_NAMES[detailIndex];
   detailBtn.title = detailAuto
-    ? "Picture detail: Auto, aiming for " + DETAIL_TARGET + " fps at " + percent +
+    ? "Picture detail: Auto, aiming for " + detailTarget() + " fps at " + percent +
       "% of the desktop. Tap to take it off Auto, at full size."
     : "Picture detail: " + DETAIL_NAMES[detailIndex] + ", " + percent +
       "% of the desktop." + (detailIndex < DETAIL_LEVELS.length - 1
@@ -1351,10 +1359,11 @@ function governFps() {
     detailFast = 0;
     return;
   }
-  if (fps < DETAIL_TARGET * 0.85) {
+  const target = detailTarget();
+  if (fps < target * 0.85) {
     detailSlow += 1;
     detailFast = 0;
-  } else if (fps >= DETAIL_TARGET && streamFps >= 10) {
+  } else if (fps >= target && streamFps >= 10) {
     /* Spend detail again only on a picture the stream can actually carry: a paused
      * or loading game draws quickly, and a stream that is only delivering a dozen
      * updates would spend the detail and hand it straight back. */
@@ -1383,6 +1392,7 @@ async function pollStream() {
       gameRunning = !!state.game;
       gameFps = Number.isFinite(state.fps) ? state.fps : null;
       fpsWhy = gameFps === null ? (state.fpsWhy || null) : null;
+      fpsCap = Number.isFinite(state.fpsCap) ? state.fpsCap : 0;
       if (!detailSynced) {
         detailSynced = true;
         if (detailAuto && state.scale) {
