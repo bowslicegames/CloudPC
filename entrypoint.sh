@@ -56,8 +56,11 @@ unset OFFLOAD_WIDTH OFFLOAD_HEIGHT
 
 # glibc gives every thread its own malloc arena (8 x cores of 64 MB mappings). On
 # a one-core container with Java, Mesa and GTK all allocating, capping the arenas
-# keeps RSS down and the page faults with it.
-export MALLOC_ARENA_MAX="${MALLOC_ARENA_MAX:-2}"
+# keeps RSS down and the page faults with it. It must not cap them so far that
+# threads meant to run beside each other queue on one malloc lock, though — two
+# arenas for a render thread, three raster workers, chunk builders and two GC
+# workers is how a multi-core game still behaves like a one-core one — so the
+# number is set below from the CPU budget instead of here.
 
 # Minecraft has no GPU here: it draws through Mesa's llvmpipe CPU rasteriser.
 # llvmpipe starts one worker per core and takes that count from the host machine,
@@ -65,14 +68,22 @@ export MALLOC_ARENA_MAX="${MALLOC_ARENA_MAX:-2}"
 # threads fighting over one core. Pin it to the quota, and keep the LLVM-compiled
 # shader cache on /data so Minecraft does not recompile every shader each boot.
 # The quota is read once, here, and every rule below works from these two numbers.
-# CPU_CORE_COUNT is how many threads' worth of work the cgroup will fund, rounded up:
-# 125% still funds a whole second thread's worth above one core. CPU_QUOTA_PERCENT is
-# the same quota as a percentage of one core, and that is what the question "is there
-# a second core to put this thread on" is actually asking. Parsing the file twice is
-# how the two answers drifted: 125% rounded to two cores, so Mesa's GL dispatch thread
-# was put on a core that does not exist.
+# CPU_CORE_COUNT is how many threads' worth of work the container can actually run:
+# the quota rounded up — 125% still funds a whole second thread's worth above one
+# core — then capped by the CPUs it is allowed to be scheduled on. CPU_QUOTA_PERCENT
+# is the same quota as a percentage of one core, and that is what the question "is
+# there a second core to put this thread on" is actually asking. Parsing the file
+# twice is how those answers drifted: 125% rounded to two cores, so Mesa's GL
+# dispatch thread was put on a core that does not exist.
+CPU_QUOTA_UNSPENDABLE=0
+CPU_QUOTA_CORES=""
 cgroup_cpu_quota() {
   local quota="" period=""
+  # Which CPUs the container may run on at all, quota or not. sched_getaffinity is
+  # what nproc reports and it is the hard edge: no amount of cgroup quota gets a
+  # thread scheduled on a CPU outside this set.
+  CPU_AVAILABLE_CPUS="$(nproc 2>/dev/null || echo 1)"
+  if ! [[ "$CPU_AVAILABLE_CPUS" =~ ^[1-9][0-9]*$ ]]; then CPU_AVAILABLE_CPUS=1; fi
   if [[ -r /sys/fs/cgroup/cpu.max ]]; then
     read -r quota period < /sys/fs/cgroup/cpu.max || true
   fi
@@ -88,14 +99,36 @@ cgroup_cpu_quota() {
      && [[ "${period:-0}" =~ ^[0-9]+$ ]] && (( period > 0 )); then
     CPU_QUOTA_PERCENT=$(( quota * 100 / period ))
     if (( CPU_QUOTA_PERCENT < 1 )); then CPU_QUOTA_PERCENT=1; fi
-    CPU_CORE_COUNT=$(( (quota + period - 1) / period ))
+    CPU_QUOTA_CORES=$(( (quota + period - 1) / period ))
+    CPU_CORE_COUNT="$CPU_QUOTA_CORES"
+    # Quota above the allowed CPU set cannot be spent. This is the difference
+    # between a 300% allocation and three cores: a container pinned to one CPU can
+    # only take turns, and sizing the JVM and llvmpipe for three would put every
+    # worker it has on that one CPU. Cap the thread counts at what can run, and
+    # report the gap instead of pretending the quota is usable.
+    if (( CPU_CORE_COUNT > CPU_AVAILABLE_CPUS )); then
+      CPU_CORE_COUNT="$CPU_AVAILABLE_CPUS"
+      CPU_QUOTA_UNSPENDABLE=1
+    fi
     return 0
   fi
-  # No quota: the whole host, which is also what llvmpipe would have assumed.
-  CPU_CORE_COUNT="$(nproc)"
+  # No quota: the whole CPU set, which is also what llvmpipe would have assumed.
+  CPU_CORE_COUNT="$CPU_AVAILABLE_CPUS"
   CPU_QUOTA_PERCENT=$(( CPU_CORE_COUNT * 100 ))
 }
 cgroup_cpu_quota
+
+MALLOC_ARENA_MAX="${MALLOC_ARENA_MAX:-$(( CPU_CORE_COUNT >= 3 ? 4 : 2 ))}"
+export MALLOC_ARENA_MAX
+
+# The app's CPU setting can be a quota, a CPU set, or both. When the quota is the
+# bigger of the two, Minecraft's threads have nowhere to run beside each other and
+# the app looks like it is using one core however much CPU it was given — which is
+# not something this image can fix, only something it can name.
+if (( CPU_QUOTA_UNSPENDABLE == 1 )); then
+  CPU_ALLOWED_LIST="$(sed -n 's/^Cpus_allowed_list:[[:space:]]*//p' /proc/self/status 2>/dev/null | head -n1 || true)"
+  echo "WARNING: the cgroup allows ${CPU_QUOTA_CORES} CPU(s) of quota (${CPU_QUOTA_PERCENT}%), but this container may only run on ${CPU_AVAILABLE_CPUS} CPU(s) (Cpus_allowed_list ${CPU_ALLOWED_LIST:-unknown}). The extra quota cannot be used: raise the app's CPU allocation so it includes more than one CPU, not just a larger percentage. Sizing for ${CPU_CORE_COUNT}."
+fi
 
 LP_NUM_THREADS="${LP_NUM_THREADS:-$CPU_CORE_COUNT}"
 if ! [[ "${LP_NUM_THREADS:-}" =~ ^[1-9][0-9]*$ ]]; then
@@ -130,13 +163,13 @@ fi
 # *alongside* the game. GLTHREAD=1 forces it on and GLTHREAD=0 forces it off.
 GLTHREAD="${GLTHREAD:-auto}"
 if [[ "$GLTHREAD" == "auto" ]]; then
-  if (( CPU_QUOTA_PERCENT >= 175 )); then GLTHREAD=1; else GLTHREAD=0; fi
+  if (( CPU_QUOTA_PERCENT >= 175 && CPU_CORE_COUNT >= 2 )); then GLTHREAD=1; else GLTHREAD=0; fi
 fi
 if [[ "$GLTHREAD" == "1" ]]; then
   export mesa_glthread=true
   echo "CloudPC: Mesa threaded GL dispatch on (GLTHREAD=1)."
 else
-  echo "CloudPC: Mesa threaded GL dispatch off: ${CPU_QUOTA_PERCENT}% of a core is not a second core to put it on (GLTHREAD=1 forces it on)."
+  echo "CloudPC: Mesa threaded GL dispatch off: ${CPU_QUOTA_PERCENT}% of a core across ${CPU_CORE_COUNT} allowed CPU(s) is not a second core to put it on (GLTHREAD=1 forces it on)."
 fi
 
 CPU_BUDGET="$CPU_CORE_COUNT"
@@ -210,13 +243,14 @@ stream_size() {
 # one or two cores the encoder is a rival for the core the game renders on: full size
 # keeps 46 ms, and a stream at 640x400 or below, four times less to read and encode,
 # gets 28. At three cores that rivalry is gone, because the render thread and the
-# raster workers run while x11vnc looks, so full size gets 10 ms and 18 ms of the
-# frame's age is gone. Four milliseconds is the floor rather than zero because the poll
-# is a wakeup, not an event: at zero x11vnc spins on the X connection to notice that
-# nothing happened, and takes a core to do it.
+# raster workers run while x11vnc looks, so the poll drops to its floor: 2 ms between
+# looks still leaves every wakeup a timeout rather than a spin, and 3 ms of defer is
+# enough to put the handful of rectangles one frame produces into a single encode.
+# That is 5 ms of the picture's age instead of 10, and on a 20 fps game it hands a
+# tenth of a frame back to the player every single frame.
 if (( CPU_BUDGET >= 3 )); then
-  : "${VNC_WAIT:=4}"
-  : "${VNC_DEFER:=6}"
+  : "${VNC_WAIT:=2}"
+  : "${VNC_DEFER:=3}"
 elif (( $(stream_scale) <= 80 )); then
   : "${VNC_WAIT:=12}"
   : "${VNC_DEFER:=16}"
@@ -299,25 +333,38 @@ set_instance_default MinecraftWinWidth 960 800
 set_instance_default MinecraftWinHeight 540 500
 set_instance_default MinecraftWinHeight 450 500
 
-# The JVM is the other process that has to fit in one and a half cores. Prism
+# The JVM is the other process that has to fit in this container's budget. Prism
 # leaves it on G1, whose concurrent marking, refinement threads and per-store
 # barrier are all extra work that has to be squeezed into the core the game is
 # drawing on. Below about two cores a stop-the-world Serial GC is faster: one
 # collection pass, no background threads, a pointer-bump allocator and no barrier.
-# The other two flags are container wins: stop writing the perf counters through a
+# At three cores the trade goes the other way. A Serial collection stops the render
+# thread for tens of milliseconds on a 2.5 GiB NeoForge heap, and that stall is the
+# input delay a player actually feels: the same thread reads the mouse, and it reads
+# nothing while the heap is being collected. G1 with a 10 ms pause target and two
+# collection workers collects on the other cores, keeps the pause in single digits,
+# and is the one part of the official client that is genuinely multi-threaded. The
+# remaining flags are container wins: stop writing the perf counters through a
 # memory-mapped file, and cap the JIT compilers at two so a host with dozens of
 # cores cannot fill this container with compiler threads.
 # The JVM sizes every pool it has from the host's core count, not from the cgroup
 # quota: on an eight-core host this container's Minecraft got a background executor,
 # a ForkJoin pool, Sodium's chunk builders and a dozen idling threads all sized for
-# eight cores, and all of them fighting for the one and a bit cores it actually
-# gets. -XX:ActiveProcessorCount tells the JVM the truth, so every one of those
-# pools, and Runtime.availableProcessors() that the mods read, matches the CPU the
-# container is allowed.
+# eight cores, and all of them fighting for the cores it actually gets.
+# -XX:ActiveProcessorCount tells the JVM the truth, so every one of those pools, and
+# Runtime.availableProcessors() that the mods read, matches the CPU the container is
+# allowed — including the case where the quota is large but the allowed CPU set is
+# not.
 JAVA_CPUS="$CPU_BUDGET"
 if (( JAVA_CPUS < 1 )); then JAVA_CPUS=1; fi
 if (( JAVA_CPUS > 16 )); then JAVA_CPUS=16; fi
-CLOUDPC_JVM_ARGS="-XX:+UseSerialGC -XX:+PerfDisableSharedMem -XX:CICompilerCount=2 -XX:ActiveProcessorCount=${JAVA_CPUS}"
+if (( CPU_BUDGET >= 3 )); then
+  GC_NAME="G1"
+  CLOUDPC_JVM_ARGS="-XX:+UseG1GC -XX:MaxGCPauseMillis=10 -XX:ParallelGCThreads=2 -XX:ConcGCThreads=1 -XX:+PerfDisableSharedMem -XX:CICompilerCount=2 -XX:ActiveProcessorCount=${JAVA_CPUS}"
+else
+  GC_NAME="Serial GC"
+  CLOUDPC_JVM_ARGS="-XX:+UseSerialGC -XX:+PerfDisableSharedMem -XX:CICompilerCount=2 -XX:ActiveProcessorCount=${JAVA_CPUS}"
+fi
 
 # Prism records "use the defaults" as OverrideJavaArgs=false, so that is the only
 # state that gets taken over. After that the args are ours until someone types their
@@ -335,7 +382,9 @@ prism_jvm_args() {
     return 1
   fi
   current="$(sed -n 's/^JvmArgs=//p' "$cfg" | tail -n 1)"
-  if [[ -n "$current" && "$current" != -XX:+UseSerialGC* ]]; then
+  # Ours is either preset: Serial below three cores, G1 at three and up. A value the
+  # user typed themselves is recognised by starting with neither collector flag.
+  if [[ -n "$current" && "$current" != -XX:+UseSerialGC* && "$current" != -XX:+UseG1GC* ]]; then
     return 1
   fi
   if [[ "$current" == "$CLOUDPC_JVM_ARGS" ]]; then
@@ -346,7 +395,7 @@ prism_jvm_args() {
   else
     printf 'JvmArgs=%s\n' "$CLOUDPC_JVM_ARGS" >> "$cfg"
   fi
-  echo "CloudPC: Minecraft JVM args set for ${JAVA_CPUS} CPU core(s) (Serial GC, APCount, 2 JIT threads)"
+  echo "CloudPC: Minecraft JVM args set for ${JAVA_CPUS} CPU core(s) (${GC_NAME}, APCount, 2 JIT threads)"
   return 0
 }
 if [[ -f "$INSTANCE_CFG" ]]; then
@@ -626,10 +675,11 @@ if [[ -n "$GL_RENDERER_LINE" ]]; then
 fi
 
 # One line with every number that decides how fast this session can be, so a slow
-# desktop can be diagnosed from the log instead of guessed at. nproc is what the
-# host reports, which is why llvmpipe needs the cgroup quota instead of it.
+# desktop can be diagnosed from the log instead of guessed at. nproc is the CPUs the
+# container may run on, not what the cgroup will fund, which is why llvmpipe's worker
+# count comes from the budget and not from nproc alone.
 read -r STREAM_WIDTH STREAM_HEIGHT < <(stream_size)
-echo "CloudPC: performance -- ${CPU_BUDGET} CPU core(s) allowed (quota ${CPU_QUOTA_PERCENT}%, nproc $(nproc)), llvmpipe ${LP_NUM_THREADS} thread(s), framebuffer ${SCREEN_WIDTH}x${SCREEN_HEIGHT} (PIXEL_OFFLOAD=${PIXEL_OFFLOAD:-0}, UI scale ${UI_SCALE}), stream ${STREAM_WIDTH}x${STREAM_HEIGHT} at $(stream_scale)% of it, ${VNC_WAIT}/${VNC_DEFER} ms, Minecraft on Serial GC with ${JAVA_CPUS} core(s), view $(sed -n 's/^renderDistance://p' "$INSTANCE_OPTIONS" 2>/dev/null | head -n1)/sim $(sed -n 's/^simulationDistance://p' "$INSTANCE_OPTIONS" 2>/dev/null | head -n1)."
+echo "CloudPC: performance -- ${CPU_BUDGET} CPU core(s) allowed (quota ${CPU_QUOTA_PERCENT}%, nproc $(nproc)), llvmpipe ${LP_NUM_THREADS} thread(s), framebuffer ${SCREEN_WIDTH}x${SCREEN_HEIGHT} (PIXEL_OFFLOAD=${PIXEL_OFFLOAD:-0}, UI scale ${UI_SCALE}), stream ${STREAM_WIDTH}x${STREAM_HEIGHT} at $(stream_scale)% of it, ${VNC_WAIT}/${VNC_DEFER} ms, Minecraft on ${GC_NAME} with ${JAVA_CPUS} core(s), view $(sed -n 's/^renderDistance://p' "$INSTANCE_OPTIONS" 2>/dev/null | head -n1)/sim $(sed -n 's/^simulationDistance://p' "$INSTANCE_OPTIONS" 2>/dev/null | head -n1)."
 case "$GL_RENDERER_LINE" in
   *softpipe*)
     echo "WARNING: Mesa is on softpipe, which is several times slower than llvmpipe. Check that libgl1-mesa-dri is installed; GALLIUM_DRIVER=llvmpipe forces the fast rasteriser."
