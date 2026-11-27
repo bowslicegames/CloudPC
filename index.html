@@ -1428,18 +1428,27 @@ pollStream();
  * what PIXEL_OFFLOAD in entrypoint.sh selects, and this stage is the half that makes
  * it usable.
  *
- * It does not move Minecraft's rendering. The game still draws every frame on the
- * container's CPU through llvmpipe; this only takes over the last stage after those
- * pixels arrive. All-or-nothing on purpose: without WebGPU, without an adapter, or
- * after a lost device, the overlay is removed and the canvas underneath is shown
- * exactly as before.
+ * It does not move Minecraft's rendering, and nothing on the device can. The game's
+ * OpenGL context, framebuffer, depth buffer, textures and shaders all live in the
+ * container, and a draw call that has to read what the previous pass wrote cannot be
+ * shipped over a link: Mesa removed indirect GLX years ago, VirGL needs a virtio GPU
+ * device this app does not have, and a tablet is not an X server. So the split is
+ * the only one that exists — the container renders, the device does everything after
+ * the pixels exist.
+ *
+ * Two backends, one shader. WebGPU is used when the browser exposes it; otherwise the
+ * same bilinear upscale and five-tap adaptive unsharp run as WebGL2, which is a real
+ * GPU stage and the one every iPad from iPadOS 15 has (WebGPU is iPadOS 26 and
+ * newer, and Chrome on iPadOS is a WebKit shell that is never given it). Only when
+ * neither exists is the overlay removed and the canvas underneath shown as before.
  */
 const UPSCALE_KEY = "cloudpc.gpuUpscale";
 const gpu = {
   wanted: true, ready: false, failed: false, starting: false, generation: 0,
-  canvas: null, context: null, device: null, pipeline: null, sampler: null,
+  canvas: null, backend: null, context: null, device: null, pipeline: null, sampler: null,
   source: null, sourceWidth: 0, sourceHeight: 0, bindGroup: null, uniform: null,
-  frame: 0, lastDraw: 0, strength: 0.42,
+  gl: null, program: null, buffer: null, texture: null, texWidth: 0, texHeight: 0,
+  noWebgpu: false, frame: 0, lastDraw: 0, strength: 0.42,
 };
 try { gpu.wanted = localStorage.getItem(UPSCALE_KEY) !== "0"; } catch { /* default on */ }
 
@@ -1484,30 +1493,83 @@ fn fs(frag: VSOut) -> @location(0) vec4f {
 }
 `;
 
+/* The same two shaders in GLSL ES 3.00, for the browsers that have no WebGPU. The
+ * arithmetic is deliberately identical to GPU_WGSL above, tap for tap: the two
+ * backends have to look the same or turning the stage off and on would change the
+ * picture. A triangle strip instead of the WebGPU quad's six vertices, because a
+ * strip of four is all a fullscreen pass needs. */
+const GPU_GLSL_VS = `#version 300 es
+in vec2 aPos;
+out vec2 vUv;
+void main() {
+  vUv = vec2((aPos.x + 1.0) * 0.5, (1.0 - aPos.y) * 0.5);
+  gl_Position = vec4(aPos, 0.0, 1.0);
+}`;
+
+const GPU_GLSL_FS = `#version 300 es
+precision highp float;
+in vec2 vUv;
+out vec4 outColor;
+uniform sampler2D tex;
+uniform vec2 texel;
+uniform float strength;
+void main() {
+  vec3 c = texture(tex, vUv).rgb;
+  vec3 n = texture(tex, vUv + vec2(0.0, -texel.y)).rgb;
+  vec3 s = texture(tex, vUv + vec2(0.0,  texel.y)).rgb;
+  vec3 e = texture(tex, vUv + vec2( texel.x, 0.0)).rgb;
+  vec3 w = texture(tex, vUv + vec2(-texel.x, 0.0)).rgb;
+  vec3 mn = min(min(min(n, s), min(e, w)), c);
+  vec3 mx = max(max(max(n, s), max(e, w)), c);
+  vec3 amp = sqrt(clamp(min(mn, vec3(1.0) - mx) / max(mx, vec3(0.0001)), vec3(0.0), vec3(1.0)));
+  vec3 k = amp * (strength * 0.25);
+  vec3 sharp = c * (vec3(1.0) + vec3(4.0) * k) - k * (n + s + e + w);
+  outColor = vec4(clamp(sharp, vec3(0.0), vec3(1.0)), 1.0);
+}`;
+
+function webgl2Context(element) {
+  if (!element) return null;
+  try {
+    return element.getContext("webgl2", {
+      alpha: false, antialias: false, depth: false, stencil: false,
+      premultipliedAlpha: false, preserveDrawingBuffer: false,
+      powerPreference: "low-power", desynchronized: true,
+    });
+  } catch { return null; }
+}
+
+/* Probed once and remembered: every probe would take an iOS context slot, and the
+ * number of those is small. */
+let webgl2Probe = null;
+function hasWebgl2() {
+  if (webgl2Probe === null) webgl2Probe = Boolean(webgl2Context(document.createElement("canvas")));
+  return webgl2Probe;
+}
+
 /* Three different things can leave this stage unavailable and only one of them is
  * the browser's fault, so the reason is worked out rather than assumed:
  *
- *   insecure  the page is not a secure context. WebGPU is only exposed over HTTPS
- *             (or localhost), so on http:// navigator.gpu does not exist at all, in
- *             every browser, however new it is. This is the common one: an app served
- *             on a bare port is plain HTTP.
- *   browser   a secure page, but no WebGPU: an iPad below iPadOS 26, or Chrome on
- *             iPadOS, which is a WebKit shell that is not given WebGPU.
- *   ok        navigator.gpu exists; a failure from here on is the device or the
- *             shader, and the stage falls back on its own.
+ *   insecure  the page is not a secure context and the browser has no WebGL2 either.
+ *             WebGPU is only exposed over HTTPS (or localhost), so on http://
+ *             navigator.gpu does not exist at all, in every browser, however new it
+ *             is; WebGL2 is not restricted that way, so this now needs a browser
+ *             without WebGL2 as well.
+ *   browser   neither backend: no WebGPU and no WebGL2.
+ *   ok        at least one backend exists; a failure from here on is the device or
+ *             the shader, and the stage falls back on its own.
  */
 function gpuUnavailableReason() {
   if (typeof navigator !== "undefined" && navigator.gpu) return "ok";
+  if (hasWebgl2()) return "ok";
   if (typeof window !== "undefined" && window.isSecureContext === false) return "insecure";
   return "browser";
 }
 
 function gpuUnavailableText(reason) {
   if (reason === "insecure") {
-    return "GPU upscale needs HTTPS: this page is " + location.protocol +
-      "//, and browsers hide WebGPU on insecure origins. Open CloudPC over https://.";
+    return "This browser has neither WebGPU nor WebGL2, and WebGPU is additionally hidden on an insecure page like this one (" + location.protocol + "//). Open CloudPC over https:// in Safari 15 or newer.";
   }
-  return "This browser has no WebGPU. On an iPad that means Safari on iPadOS 26 or newer.";
+  return "This browser has neither WebGPU nor WebGL2, so the device cannot scale the stream; the browser's own scaling is used instead. On an iPad, Safari 15 or newer has WebGL2.";
 }
 
 let explainTimer = 0;
@@ -1533,7 +1595,8 @@ function paintUpscaleButton() {
   upscaleBtn.title = !supported
     ? gpuUnavailableText(reason)
     : gpu.ready
-      ? "GPU upscale on: the device scales and sharpens the stream (tap to turn off)"
+      ? "GPU upscale on (" + (gpu.backend === "webgl2" ? "WebGL2" : "WebGPU") +
+        "): the device scales and sharpens the stream (tap to turn off)"
       : "GPU upscale off: the browser's own scaling draws the stream (tap to turn on)";
 }
 
@@ -1599,29 +1662,54 @@ function drawGpuFrame() {
   const height = canvas.height;
   if (!width || !height) return;
   try {
-    if (gpu.sourceWidth !== width || gpu.sourceHeight !== height) resizeGpuSource(width, height);
-    if (!gpu.bindGroup) return;
     sizeGpuCanvas();
     if (!gpu.canvas.width || !gpu.canvas.height) return;
-    gpu.device.queue.copyExternalImageToTexture({ source: canvas }, { texture: gpu.source }, { width, height });
-    const encoder = gpu.device.createCommandEncoder();
-    const pass = encoder.beginRenderPass({
-      colorAttachments: [{
-        view: gpu.context.getCurrentTexture().createView(),
-        clearValue: { r: 0, g: 0, b: 0, a: 1 },
-        loadOp: "clear", storeOp: "store",
-      }],
-    });
-    pass.setPipeline(gpu.pipeline);
-    pass.setBindGroup(0, gpu.bindGroup);
-    pass.draw(6);
-    pass.end();
-    gpu.device.queue.submit([encoder.finish()]);
+    if (gpu.backend === "webgl2") drawWebglFrame(width, height);
+    else drawWebgpuFrame(width, height);
   } catch (error) {
     console.warn("CloudPC: GPU stage stopped, falling back to browser scaling:", error && error.message ? error.message : error);
     stopGpuStage();
     gpu.failed = true;
   }
+}
+
+function drawWebgpuFrame(width, height) {
+  if (gpu.sourceWidth !== width || gpu.sourceHeight !== height) resizeGpuSource(width, height);
+  if (!gpu.bindGroup) return;
+  gpu.device.queue.copyExternalImageToTexture({ source: canvas }, { texture: gpu.source }, { width, height });
+  const encoder = gpu.device.createCommandEncoder();
+  const pass = encoder.beginRenderPass({
+    colorAttachments: [{
+      view: gpu.context.getCurrentTexture().createView(),
+      clearValue: { r: 0, g: 0, b: 0, a: 1 },
+      loadOp: "clear", storeOp: "store",
+    }],
+  });
+  pass.setPipeline(gpu.pipeline);
+  pass.setBindGroup(0, gpu.bindGroup);
+  pass.draw(6);
+  pass.end();
+  gpu.device.queue.submit([encoder.finish()]);
+}
+
+/* One texture, one upload, one triangle strip. The upload is a texSubImage2D into a
+ * texture allocated once at the framebuffer's size: re-specifying the image every
+ * frame would make the driver allocate a new store for every frame of a 30 fps
+ * stream. */
+function drawWebglFrame(width, height) {
+  const gl = gpu.gl;
+  if (!gl || !gpu.program) return;
+  gl.bindTexture(gl.TEXTURE_2D, gpu.texture);
+  if (gpu.texWidth !== width || gpu.texHeight !== height) {
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, width, height, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+    gl.uniform2f(gl.getUniformLocation(gpu.program, "texel"), 1 / width, 1 / height);
+    gpu.texWidth = width;
+    gpu.texHeight = height;
+  }
+  gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, gl.RGBA, gl.UNSIGNED_BYTE, canvas);
+  gl.viewport(0, 0, gl.drawingBufferWidth, gl.drawingBufferHeight);
+  gl.clear(gl.COLOR_BUFFER_BIT);
+  gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
 }
 
 function startGpuLoop() {
@@ -1644,9 +1732,21 @@ function stopGpuStage() {
   if (gpu.canvas && gpu.canvas.parentNode) gpu.canvas.parentNode.removeChild(gpu.canvas);
   if (gpu.source) { try { gpu.source.destroy(); } catch { /* already gone */ } }
   if (gpu.device) { try { gpu.device.destroy(); } catch { /* already gone */ } }
+  if (gpu.gl) {
+    try {
+      if (gpu.texture) gpu.gl.deleteTexture(gpu.texture);
+      if (gpu.buffer) gpu.gl.deleteBuffer(gpu.buffer);
+      if (gpu.program) gpu.gl.deleteProgram(gpu.program);
+      /* Hand the context back now: iOS caps how many a page may hold, and a stage
+       * that is turned off and on again would otherwise leak one per tap. */
+      const lose = gpu.gl.getExtension("WEBGL_lose_context");
+      if (lose) lose.loseContext();
+    } catch { /* already gone */ }
+  }
   gpu.ready = false;
   gpu.starting = false;
   gpu.canvas = null;
+  gpu.backend = null;
   gpu.context = null;
   gpu.device = null;
   gpu.pipeline = null;
@@ -1654,20 +1754,59 @@ function stopGpuStage() {
   gpu.source = null;
   gpu.bindGroup = null;
   gpu.uniform = null;
+  gpu.gl = null;
+  gpu.program = null;
+  gpu.buffer = null;
+  gpu.texture = null;
+  gpu.texWidth = 0;
+  gpu.texHeight = 0;
   gpu.sourceWidth = 0;
   gpu.sourceHeight = 0;
   paintUpscaleButton();
 }
 
+/* WebGPU first, then WebGL2. A WebGPU failure must not throw the whole stage away,
+ * because the device in the user's hands usually has the other backend: an iPad on
+ * iPadOS 17 has WebGL2 and no WebGPU at all, and Chrome on iPadOS never gets
+ * navigator.gpu. After a lost WebGPU device, noWebgpu keeps the retry on WebGL2 so a
+ * driver that keeps losing contexts cannot loop between two backends. */
 async function startGpuStage() {
-  if (!gpu.wanted || gpu.ready || gpu.starting || !navigator.gpu) { paintUpscaleButton(); return; }
+  if (!gpu.wanted || gpu.ready || gpu.starting) { paintUpscaleButton(); return; }
   gpu.starting = true;
   const generation = gpu.generation;
+  try {
+    if (typeof navigator !== "undefined" && navigator.gpu && !gpu.noWebgpu) {
+      try {
+        await startWebgpuStage(generation);
+      } catch (error) {
+        if (generation !== gpu.generation || !gpu.wanted) return;
+        console.warn("CloudPC: WebGPU upscale unavailable, trying WebGL2:", error && error.message ? error.message : error);
+      }
+    }
+    if (gpu.ready) return;
+    if (!hasWebgl2()) throw new Error("neither WebGPU nor WebGL2 is available");
+    startWebglStage();
+  } catch (error) {
+    if (generation !== gpu.generation) return;
+    console.warn("CloudPC: GPU upscale unavailable, using browser scaling:", error && error.message ? error.message : error);
+    stopGpuStage();
+    gpu.failed = true;
+  } finally {
+    gpu.starting = false;
+    paintUpscaleButton();
+  }
+}
+
+async function startWebgpuStage(generation) {
+  /* Outside the try on purpose: a throw before requestDevice() still has to be able to
+   * hand back a device that already exists, and a const declared inside try is not in
+   * scope in catch. */
+  let device = null;
   try {
     const adapter = await navigator.gpu.requestAdapter({ powerPreference: "low-power" });
     if (generation !== gpu.generation || !gpu.wanted) return;
     if (!adapter) throw new Error("no WebGPU adapter");
-    const device = await adapter.requestDevice();
+    device = await adapter.requestDevice();
     if (generation !== gpu.generation || !gpu.wanted) { device.destroy(); return; }
 
     const element = document.createElement("canvas");
@@ -1703,26 +1842,99 @@ async function startGpuStage() {
     gpu.source = null;
     gpu.sourceWidth = 0;
     gpu.sourceHeight = 0;
-    gpu.ready = true;
+    gpu.backend = "webgpu";
     screenEl.appendChild(element);
+    gpu.ready = true;
 
     device.lost.then(info => {
       if (info.reason === "destroyed") return;
-      console.warn("CloudPC: WebGPU device lost, falling back to browser scaling:", info.message);
+      console.warn("CloudPC: WebGPU device lost, restarting on WebGL2:", info.message);
+      gpu.noWebgpu = true;
       stopGpuStage();
-      gpu.failed = true;
+      gpu.failed = false;
+      startGpuStage();
     });
 
     startGpuLoop();
   } catch (error) {
-    if (generation !== gpu.generation) return;
-    console.warn("CloudPC: GPU upscale unavailable, using browser scaling:", error && error.message ? error.message : error);
+    /* Nothing is published to gpu.* until every step above has succeeded, so a
+     * failure here only has to give the device back. */
+    if (device) { try { device.destroy(); } catch { /* already gone */ } }
+    throw error;
+  }
+}
+
+function startWebglStage() {
+  const element = document.createElement("canvas");
+  element.className = "gpuStage";
+  element.setAttribute("aria-hidden", "true");
+  const gl = webgl2Context(element);
+  if (!gl) throw new Error("no webgl2 context");
+
+  const program = gl.createProgram();
+  if (!program) throw new Error("no webgl2 program");
+  for (const [type, source] of [[gl.VERTEX_SHADER, GPU_GLSL_VS], [gl.FRAGMENT_SHADER, GPU_GLSL_FS]]) {
+    const shader = gl.createShader(type);
+    gl.shaderSource(shader, source);
+    gl.compileShader(shader);
+    if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
+      const log = String(gl.getShaderInfoLog(shader) || "").trim();
+      gl.deleteShader(shader);
+      gl.deleteProgram(program);
+      throw new Error("webgl2 shader: " + log);
+    }
+    gl.attachShader(program, shader);
+    gl.deleteShader(shader);
+  }
+  gl.linkProgram(program);
+  if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+    const log = String(gl.getProgramInfoLog(program) || "").trim();
+    gl.deleteProgram(program);
+    throw new Error("webgl2 link: " + log);
+  }
+
+  const buffer = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, 1, 1, 1, -1, -1, 1, -1]), gl.STATIC_DRAW);
+  const position = gl.getAttribLocation(program, "aPos");
+  gl.enableVertexAttribArray(position);
+  gl.vertexAttribPointer(position, 2, gl.FLOAT, false, 0, 0);
+
+  const texture = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, texture);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+
+  gl.useProgram(program);
+  gl.uniform1i(gl.getUniformLocation(program, "tex"), 0);
+  gl.uniform1f(gl.getUniformLocation(program, "strength"), gpu.strength);
+  gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false);
+  gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
+  gl.clearColor(0, 0, 0, 1);
+
+  /* iOS takes GL contexts back under memory pressure. A lost context makes every
+   * call a no-op, which would leave this overlay black over a perfectly good stream,
+   * so it removes itself instead and the compositor's scaling shows through. */
+  element.addEventListener("webglcontextlost", event => {
+    event.preventDefault();
+    console.warn("CloudPC: WebGL2 context lost, falling back to browser scaling");
     stopGpuStage();
     gpu.failed = true;
-  } finally {
-    gpu.starting = false;
-    paintUpscaleButton();
-  }
+  }, false);
+
+  gpu.gl = gl;
+  gpu.program = program;
+  gpu.buffer = buffer;
+  gpu.texture = texture;
+  gpu.texWidth = 0;
+  gpu.texHeight = 0;
+  gpu.backend = "webgl2";
+  gpu.canvas = element;
+  screenEl.appendChild(element);
+  gpu.ready = true;
+  startGpuLoop();
 }
 
 /* The stage lives inside #screen, which connect() empties on every reconnect, so
@@ -1744,6 +1956,8 @@ upscaleBtn.addEventListener("click", () => {
   try { localStorage.setItem(UPSCALE_KEY, gpu.wanted ? "1" : "0"); } catch { /* ignore */ }
   if (gpu.wanted) {
     gpu.failed = false;
+    /* A manual retry may try WebGPU again even if a lost device sent us to WebGL2. */
+    gpu.noWebgpu = false;
     startGpuStage();
   } else {
     stopGpuStage();
