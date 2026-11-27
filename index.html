@@ -112,7 +112,7 @@ button[aria-pressed="true"],button.primary{background:var(--accent);color:var(--
   background:rgba(34,48,74,.6);font-size:12px;line-height:1.1;letter-spacing:.01em;
   pointer-events:auto;touch-action:none;backdrop-filter:blur(6px);
 }
-#lookside .actgrid button[data-mouse]{font-size:12.5px;font-weight:700}
+#lookside .actgrid button[data-click]{font-size:12.5px;font-weight:700}
 
 /* Hotbar: the nine slots along the bottom, where Minecraft's own bar sits. It is a
  * strip of its own rather than part of the look half, so reaching for a slot never
@@ -169,6 +169,7 @@ button[aria-pressed="true"],button.primary{background:var(--accent);color:var(--
     <button id="keyboardBtn" type="button" title="On-screen keyboard" aria-label="On-screen keyboard">⌨</button>
     <button id="trackpadBtn" type="button" title="Trackpad (touch pointer)" aria-label="Trackpad" aria-pressed="false">🖱</button>
     <button id="controlsBtn" type="button" title="Game controls" aria-label="Game controls" aria-pressed="false">🎮</button>
+    <button id="launchBtn" type="button" title="Start Prism Launcher" aria-label="Start Prism Launcher">Prism</button>
     <button id="fullscreenBtn" type="button" title="Fullscreen" aria-label="Fullscreen">⛶</button>
     <button id="detailBtn" type="button" title="Picture detail">Auto</button>
     <button id="streamBtn" type="button" title="Stream quality">Fast</button>
@@ -209,8 +210,8 @@ button[aria-pressed="true"],button.primary{background:var(--accent);color:var(--
         <button type="button" data-key="ShiftLeft">Sneak</button>
         <button type="button" data-key="ControlLeft">Sprint</button>
         <button type="button" data-key="KeyE">Inv</button>
-        <button type="button" data-mouse="1">LMB</button>
-        <button type="button" data-mouse="2">RMB</button>
+        <button type="button" data-click="left">LMB</button>
+        <button type="button" data-click="right">RMB</button>
         <button type="button" data-key="Space">Jump</button>
       </div>
     </div>
@@ -253,6 +254,7 @@ const reconnectBtn = document.querySelector("#reconnect");
 const keyboardBtn = document.querySelector("#keyboardBtn");
 const trackpadBtn = document.querySelector("#trackpadBtn");
 const controlsBtn = document.querySelector("#controlsBtn");
+const launchBtn = document.querySelector("#launchBtn");
 const fullscreenBtn = document.querySelector("#fullscreenBtn");
 const streamBtn = document.querySelector("#streamBtn");
 const detailBtn = document.querySelector("#detailBtn");
@@ -343,6 +345,33 @@ fullscreenBtn.addEventListener("click", async () => {
   } catch {
     /* browsers without fullscreen support simply ignore this */
   }
+});
+
+/* ---------- launch Prism ----------
+ * Lite mode is openbox plus the launcher, with no panel and no taskbar, so once
+ * Prism is closed the only way back to it was openbox's right-click menu — which a
+ * tablet has no button for. This asks the container to start it with the same
+ * environment the session gives it. */
+launchBtn.addEventListener("click", () => {
+  launchBtn.disabled = true;
+  fetch(controlUrl("/cloudpc/launch", { what: "prism" }), { cache: "no-store" })
+    .then(response => response.json()
+      .catch(() => ({}))
+      .then(data => ({ ok: response.ok, data })))
+    .then(({ ok, data }) => {
+      if (ok && data.ok) {
+        statusEl.textContent = data.running
+          ? "Prism Launcher is already running."
+          : "Prism Launcher started.";
+      } else {
+        statusEl.textContent = "Prism Launcher did not start" +
+          (data && data.error ? ": " + data.error : ".");
+      }
+    })
+    .catch(() => {
+      statusEl.textContent = "Prism Launcher did not start: no reply from the desktop.";
+    })
+    .finally(() => { launchBtn.disabled = false; });
 });
 
 /* ---------- pointer plumbing (noVNC maps canvas mouse events itself) ---------- */
@@ -439,23 +468,6 @@ function clickMouse(button) {
   const mask = button === 2 ? 2 : button === 3 ? 4 : 1;
   dispatchMouse("mousemove", position.x, position.y, 0, button || 0);
   dispatchMouse("mousedown", position.x, position.y, mask, button || 0);
-  dispatchMouse("mouseup", position.x, position.y, 0, button || 0);
-}
-
-/* Minecraft needs a button that stays down to mine a block or place a stack, so
- * the overlay's LMB/RMB are held for as long as a finger is on them. */
-function pressMouse(button) {
-  const position = gamePoint();
-  if (!position) return;
-  cancelMove();
-  const mask = button === 2 ? 2 : button === 3 ? 4 : 1;
-  dispatchMouse("mousemove", position.x, position.y, 0, button || 0);
-  dispatchMouse("mousedown", position.x, position.y, mask, button || 0);
-}
-
-function releaseMouse(button) {
-  const position = gamePoint();
-  if (!position) return;
   dispatchMouse("mouseup", position.x, position.y, 0, button || 0);
 }
 
@@ -986,18 +998,44 @@ function stickEnd(event) {
 window.addEventListener("pointerup", stickEnd);
 window.addEventListener("pointercancel", stickEnd);
 
-for (const button of controlsEl.querySelectorAll("button[data-mouse]")) {
-  const which = Number(button.dataset.mouse);
+/* Game-overlay LMB and RMB go through the container's XTEST, not through synthetic
+ * mouse events on noVNC's canvas. Two things were wrong with the canvas route: a
+ * press is an absolute event while look moves the pointer relatively, so after a few
+ * seconds of turning the X pointer can be anywhere on the desktop; and noVNC maps a
+ * DOM button to an RFB mask with its own rules, so which mask reaches the desktop
+ * depended on the noVNC release. mouseproxy.py focuses the game window, puts the
+ * pointer back in its middle, and presses there — the same XTEST path the look drags
+ * already use. The button stays down for as long as a finger is on it, which is what
+ * mining a block or placing a stack needs. */
+function gameClick(name, down) {
+  fetch(controlUrl("/cloudpc/click", { b: name, down: down ? 1 : 0, at: "game" }), {
+    cache: "no-store",
+  })
+    .then(response => {
+      if (response.ok) return;
+      lookFail += 1;
+      lookNote = "click http " + response.status;
+      showLookDebug();
+    })
+    .catch(() => {
+      lookFail += 1;
+      lookNote = "click no reply";
+      showLookDebug();
+    });
+}
+
+for (const button of controlsEl.querySelectorAll("button[data-click]")) {
+  const which = button.dataset.click;
   button.addEventListener("pointerdown", event => {
     event.preventDefault();
     if (button.setPointerCapture) button.setPointerCapture(event.pointerId);
     button.dataset.active = "1";
-    pressMouse(which);
+    gameClick(which, true);
   });
   const release = () => {
     if (button.dataset.active !== "1") return;
     delete button.dataset.active;
-    releaseMouse(which);
+    gameClick(which, false);
   };
   button.addEventListener("pointerup", release);
   button.addEventListener("pointercancel", release);
@@ -1201,7 +1239,7 @@ streamBtn.addEventListener("click", () => {
  *
  * A frame costs the container pixels at every stage after the world is drawn: the
  * HUD and the upscale to the window, the copy out of llvmpipe, x11vnc reading the
- * damage, JPEGing it, and websockify shipping it. RenderScale already made the
+ * damage, JPEGing it, and the proxy shipping it. RenderScale already made the
  * world cheap by drawing it at a third of the window, but all of that still ran at
  * the full 800x500 — 400,000 pixels — however small the world was.
  *

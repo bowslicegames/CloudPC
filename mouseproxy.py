@@ -4,10 +4,18 @@
 These requests arrive here:
 
     GET  /...                  noVNC's files, including our index.html
-    GET  /websockify           (Upgrade: websocket) relayed byte for byte to websockify
+    GET  /websockify           (Upgrade: websocket) the RFB stream, straight to x11vnc
     GET  /cloudpc/mouse?dx=..  moved through XTEST as *relative* motion
+    GET  /cloudpc/click?b=..   an LMB/RMB press or release, through XTEST
     GET  /cloudpc/stream       the stream size, the screen size, whether the game is up
     GET  /cloudpc/stream?scale=..  resize the stream and the game window
+    GET  /cloudpc/launch?what=prism  start Prism Launcher on the desktop
+
+The websocket used to be relayed to websockify, which meant a second Python process
+and a copy of every frame in both directions. This process already terminates the
+browser's websocket, so it speaks to x11vnc's RFB socket itself instead: one less
+process, one less copy of every pixel and every keystroke, and TCP_NODELAY on the
+socket that actually carries them.
 
 The two control endpoints take their arguments in the query string and are plain
 GETs on purpose. They used to be POSTs with a JSON body and an X-CloudPC header, and
@@ -17,7 +25,7 @@ the Host header, which the old same-origin check compared against Origin (403). 
 with no custom header is what the proxy already carries for every file of this page,
 and the token below is what keeps it ours. POST still works for an older page.
 
-The last one is what makes mouse look work. RFB carries absolute pointer positions
+The mouse endpoint is what makes look work. RFB carries absolute pointer positions
 only, so a look update always had to be "a point on the desktop". But Minecraft does
 not read a pointer: it reads the mouse as the distance from the centre of its own
 window, and while you play it hides the cursor and pins it there. Any absolute point
@@ -36,13 +44,16 @@ event: look updates arrive 20 times a second, and forking a process 20 times a
 second on a one-core container is CPU taken straight from the game.
 """
 
+import base64
 import ctypes
 import ctypes.util
+import hashlib
 import json
 import mimetypes
 import os
 import secrets
 import socket
+import struct
 import subprocess
 import sys
 import threading
@@ -51,7 +62,14 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, unquote, urlsplit
 
 WEB_ROOT = os.path.abspath(os.environ.get("CLOUDPC_WEB_ROOT", "/usr/share/novnc"))
-WS_UPSTREAM = os.environ.get("CLOUDPC_WS_UPSTREAM", "127.0.0.1:8081")
+WS_UPSTREAM = os.environ.get("CLOUDPC_WS_UPSTREAM", "127.0.0.1:5900")
+# Written by entrypoint.sh: starts Prism Launcher with the session's environment.
+PRISM_LAUNCHER = os.environ.get("CLOUDPC_PRISM_LAUNCHER",
+                                 "/data/.config/cloudpc-launch-prism")
+# WebSocket odds and ends. The guid is fixed by RFC 6455; the frame cap is there so a
+# broken or hostile client cannot ask this process for an arbitrary allocation.
+WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+MAX_FRAME = 1 << 20
 DISPLAY = os.environ.get("CLOUDPC_DISPLAY", ":0")
 PORT = int(os.environ.get("NOVNC_PORT", "8080"))
 # Written by fpswatch.py: the game's own frame rate, or absent when no game is up.
@@ -271,6 +289,9 @@ class Pointer:
         self.xtst.XTestFakeRelativeMotionEvent.restype = ctypes.c_int
         self.xtst.XTestFakeRelativeMotionEvent.argtypes = [
             ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_ulong]
+        self.xtst.XTestFakeButtonEvent.restype = ctypes.c_int
+        self.xtst.XTestFakeButtonEvent.argtypes = [
+            ctypes.c_void_p, ctypes.c_uint, ctypes.c_int, ctypes.c_ulong]
 
         self.display = self.x11.XOpenDisplay(display.encode())
         if not self.display:
@@ -285,6 +306,40 @@ class Pointer:
             return True
         with self.lock:
             ok = self.xtst.XTestFakeRelativeMotionEvent(self.display, dx, dy, 0)
+            self.x11.XFlush(self.display)
+        return bool(ok)
+
+    def click(self, number, down, window=None):
+        """Press or release an X button, in the middle of the game window.
+
+        A button event is delivered wherever the pointer is, and look moves the
+        pointer relatively: after a few seconds of turning it can be anywhere on the
+        desktop, over the launcher or off the window entirely. So a game press puts
+        the pointer back in the middle of the game — where Minecraft reads the cursor
+        and where the old page aimed its clicks — and focuses the window first, which
+        is what a windowed game needs before it reads a button at all.
+
+        XTest button numbers are X's, not JavaScript's: 1 left, 2 middle, 3 right.
+        """
+        with self.lock:
+            if window is not None:
+                try:
+                    window_id = int(window["id"], 10)
+                except (KeyError, TypeError, ValueError):
+                    window_id = 0
+                if window_id:
+                    current = ctypes.c_ulong()
+                    revert = ctypes.c_int()
+                    if self.x11.XGetInputFocus(
+                            self.display, ctypes.byref(current),
+                            ctypes.byref(revert)) and current.value != window_id:
+                        self.x11.XSetInputFocus(self.display, window_id, 2, 0)
+                    self.x11.XWarpPointer(self.display, 0, window_id, 0, 0, 0, 0,
+                                          window["width"] // 2,
+                                          window["height"] // 2)
+                    self.prepared = time.monotonic()
+            ok = self.xtst.XTestFakeButtonEvent(
+                self.display, number, 1 if down else 0, 0)
             self.x11.XFlush(self.display)
         return bool(ok)
 
@@ -390,6 +445,10 @@ class Handler(BaseHTTPRequestHandler):
             return self.reply(200, "application/json", json.dumps(stream_state()))
         if path == "/cloudpc/mouse":
             return self.mouse_look()
+        if path == "/cloudpc/click":
+            return self.mouse_click()
+        if path == "/cloudpc/launch":
+            return self.launch()
         self.serve_static()
 
     def do_OPTIONS(self):
@@ -437,56 +496,178 @@ class Handler(BaseHTTPRequestHandler):
 
     # ---------- the RFB websocket ----------
 
+    def ws_send(self, payload, opcode=0x2):
+        """One unfragmented WebSocket frame.
+
+        Header and payload go out in a single sendall: on a socket with TCP_NODELAY a
+        separate header write is a separate packet, which costs the picture a
+        round trip's worth of protocol overhead for nothing. The lock is there because
+        a pong (from this thread) must never land in the middle of a frame (from the
+        relay thread).
+        """
+        header = bytearray([0x80 | opcode])
+        size = len(payload)
+        if size < 126:
+            header.append(size)
+        elif size < 65536:
+            header.append(126)
+            header += struct.pack(">H", size)
+        else:
+            header.append(127)
+            header += struct.pack(">Q", size)
+        with self.ws_lock:
+            self.wfile.write(bytes(header) + payload)
+
+    def ws_close(self):
+        """One close frame, from whichever side ends the conversation first.
+
+        Written here rather than through ws_send so the marker and the frame are the
+        same decision: two threads reach this, and a second close frame after the
+        socket has been shut down would only raise.
+        """
+        with self.ws_lock:
+            if self.ws_closed:
+                return
+            self.ws_closed = True
+            try:
+                self.wfile.write(b"\x88\x00")
+            except OSError:
+                pass
+
+    def ws_receive(self, sink, done):
+        """Browser frames in, RFB bytes out to x11vnc.
+
+        noVNC sends binary frames only, but a fragmented message and a ping are
+        allowed by the protocol and cheap to honour, so they are rather than being
+        allowed to corrupt the stream.
+        """
+        fragments = bytearray()
+        try:
+            while not done.is_set():
+                head = self.rfile.read(2)
+                if len(head) < 2:
+                    break
+                opcode = head[0] & 0x0F
+                masked = head[1] & 0x80
+                size = head[1] & 0x7F
+                if size == 126:
+                    size = struct.unpack(">H", self.rfile.read(2))[0]
+                elif size == 127:
+                    size = struct.unpack(">Q", self.rfile.read(8))[0]
+                if size > MAX_FRAME:
+                    break
+                mask = self.rfile.read(4) if masked else b""
+                payload = self.rfile.read(size) if size else b""
+                if len(payload) < size:
+                    break
+                if masked and payload:
+                    payload = bytes(byte ^ mask[index % 4]
+                                    for index, byte in enumerate(payload))
+                if opcode == 0x8:      # close
+                    self.ws_close()
+                    break
+                if opcode == 0x9:      # ping
+                    self.ws_send(payload, 0xA)
+                    continue
+                if opcode == 0xA:      # pong
+                    continue
+                if opcode in (0x1, 0x2):
+                    fragments = bytearray(payload)
+                elif opcode == 0x0:    # continuation
+                    fragments += payload
+                else:
+                    continue
+                if head[0] & 0x80:     # final fragment
+                    if fragments:
+                        sink.sendall(bytes(fragments))
+                    fragments = bytearray()
+        except (OSError, ValueError, struct.error):
+            # A truncated frame (struct.error) and a socket that went away under the
+            # reader are both just the end of this session.
+            pass
+        finally:
+            done.set()
+            try:
+                sink.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            try:
+                self.connection.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+
+    def ws_relay(self, source, done):
+        """RFB bytes in from x11vnc, binary frames out to the browser."""
+        try:
+            while not done.is_set():
+                chunk = source.recv(65536)
+                if not chunk:
+                    break
+                self.ws_send(chunk)
+        except (OSError, ValueError):
+            pass
+        finally:
+            self.ws_close()
+            done.set()
+            try:
+                self.connection.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+
     def tunnel(self):
+        """The RFB websocket, straight to x11vnc.
+
+        websockify used to terminate the browser's websocket and this process only
+        relayed the HTTP upgrade to it. That put a second Python process and a copy of
+        every frame in both directions between the encoder and the player, and the
+        input path went through it too. The upgrade is four lines of RFC 6455, so it
+        is done here instead.
+        """
+        key = (self.headers.get("Sec-WebSocket-Key") or "").strip()
+        if not key:
+            return self.reply(400, "text/plain", "websocket handshake expected")
+
         host, _, port = WS_UPSTREAM.partition(":")
         try:
             upstream = socket.create_connection((host, int(port)), timeout=15)
         except (OSError, ValueError):
-            return self.reply(502, "text/plain", "websockify is not reachable")
+            return self.reply(502, "text/plain", "the desktop is not reachable")
         upstream.settimeout(None)
 
-        # The same reason as on the HTTP side, one hop further along: websockify
-        # carries RFB frames that can be a few dozen bytes, and every one of them is
-        # something the game is waiting to draw or the player is waiting to see.
+        # RFB frames can be a few dozen bytes, and every one of them is something the
+        # game is waiting to draw or the player is waiting to see, so neither the
+        # browser hop nor the x11vnc hop may sit on one waiting for an ACK.
         for sock in (self.connection, upstream):
             try:
                 sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             except OSError:
                 pass
 
-        head = "%s %s HTTP/1.1\r\n" % (self.command, self.path)
-        for key, value in self.headers.items():
-            head += "%s: %s\r\n" % (key, value)
-        head += "\r\n"
+        accept = base64.b64encode(
+            hashlib.sha1((key + WS_GUID).encode("ascii")).digest()).decode("ascii")
+        reply = ["HTTP/1.1 101 Switching Protocols", "Upgrade: websocket",
+                 "Connection: Upgrade", "Sec-WebSocket-Accept: " + accept]
+        offered = [part.strip() for part in
+                   (self.headers.get("Sec-WebSocket-Protocol") or "").split(",")
+                   if part.strip()]
+        if offered:
+            reply.append("Sec-WebSocket-Protocol: " +
+                         ("binary" if "binary" in offered else offered[0]))
         try:
-            upstream.sendall(head.encode("latin-1"))
+            self.wfile.write(("\r\n".join(reply) + "\r\n\r\n").encode("latin-1"))
+            self.wfile.flush()
         except OSError:
             upstream.close()
-            return self.reply(502, "text/plain", "websockify is not reachable")
+            return
 
-        client = self.connection
-        client.settimeout(None)
         self.close_connection = True
+        self.ws_lock = threading.Lock()
+        self.ws_closed = False
         done = threading.Event()
-
-        def pump(source, sink):
-            try:
-                while not done.is_set():
-                    chunk = source.recv(65536)
-                    if not chunk:
-                        break
-                    sink.sendall(chunk)
-            except OSError:
-                pass
-            finally:
-                done.set()
-                try:
-                    sink.shutdown(socket.SHUT_WR)
-                except OSError:
-                    pass
-
-        workers = [threading.Thread(target=pump, args=(client, upstream), daemon=True),
-                   threading.Thread(target=pump, args=(upstream, client), daemon=True)]
+        workers = [threading.Thread(target=self.ws_receive, args=(upstream, done),
+                                    daemon=True),
+                   threading.Thread(target=self.ws_relay, args=(upstream, done),
+                                    daemon=True)]
         for worker in workers:
             worker.start()
         for worker in workers:
@@ -502,6 +683,10 @@ class Handler(BaseHTTPRequestHandler):
         path = urlsplit(self.path).path
         if path == "/cloudpc/mouse":
             return self.mouse_look()
+        if path == "/cloudpc/click":
+            return self.mouse_click()
+        if path == "/cloudpc/launch":
+            return self.launch()
         if path == "/cloudpc/stream":
             return self.resize_stream()
         return self.reply(404, "text/plain", "not found")
@@ -584,6 +769,71 @@ class Handler(BaseHTTPRequestHandler):
             "x": where.get("x"), "y": where.get("y"),
             "game": window is not None,
         }))
+
+    def mouse_click(self):
+        """An LMB/RMB press or release, injected as an X button event.
+
+        The page used to synthesise DOM mouse events on noVNC's canvas. That puts the
+        button at the mercy of three things it should not depend on: how noVNC maps a
+        DOM button to an RFB mask (it changed between noVNC releases), where the
+        canvas happens to be, and where the X pointer was left by the relative look
+        path. A press is an absolute event, so a game press goes to the middle of the
+        game window, focused, which is exactly where Minecraft reads the cursor.
+        """
+        if not self.trusted():
+            return
+        params = self.request_params()
+        number = {"left": 1, "right": 3, "middle": 2}.get(
+            str(params.get("b", "")).lower())
+        if number is None:
+            return self.reply(400, "application/json",
+                              json.dumps({"ok": False, "error": "unknown button"}))
+        down = str(params.get("down", "1")).lower() not in ("0", "false", "no")
+        at_game = str(params.get("at", "pointer")).lower() == "game"
+
+        pointer = open_pointer()
+        if pointer is None:
+            return self.reply(503, "application/json",
+                              json.dumps({"ok": False, "error": "no X display"}))
+        window = current_window() if at_game else None
+        if not pointer.click(number, down, window):
+            return self.reply(500, "application/json",
+                              json.dumps({"ok": False, "error": "injection failed"}))
+        where = pointer.position() or {}
+        self.reply(200, "application/json", json.dumps({
+            "ok": True, "button": number, "down": down,
+            "game": window is not None, "x": where.get("x"), "y": where.get("y"),
+        }))
+
+    def launch(self):
+        """Start Prism Launcher on the desktop.
+
+        Lite mode is openbox and the launcher, with no panel and no taskbar, so once
+        the launcher is closed the only way back to it was openbox's right-click menu
+        — which a tablet has no button for. The command is a script the entrypoint
+        writes at boot, because the environment it needs (dbus, XDG_RUNTIME_DIR, the
+        UI scale) is built there. A launcher that is already up is left alone: a second
+        copy would only put an \"already running\" dialog on the desktop.
+        """
+        if not self.trusted():
+            return
+        running = run(["pgrep", "-u", "cloud", "-f", "prismlauncher"], timeout=4)
+        if running is not None and running.stdout.split():
+            return self.reply(200, "application/json",
+                              json.dumps({"ok": True, "running": True}))
+        if not os.access(PRISM_LAUNCHER, os.X_OK):
+            return self.reply(503, "application/json", json.dumps(
+                {"ok": False, "error": "the launcher command is missing"}))
+        try:
+            subprocess.Popen([PRISM_LAUNCHER], env=CHILD_ENV,
+                             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL, start_new_session=True)
+        except OSError as error:
+            return self.reply(500, "application/json",
+                              json.dumps({"ok": False, "error": str(error)}))
+        print("mouseproxy: started Prism Launcher from the page", flush=True)
+        self.reply(202, "application/json",
+                   json.dumps({"ok": True, "running": False}))
 
     def resize_stream(self):
         """Trade detail for frames, live.

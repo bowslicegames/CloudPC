@@ -4,7 +4,7 @@
 The container runs on a cgroup quota — 125% of a core on the app this was written
 for — and every stage of a frame costs some of it: Minecraft's render and server
 threads, llvmpipe filling the framebuffer, x11vnc reading the damaged rectangles and
-JPEG-ing them, Xvfb copying the pixels, websockify shipping them, the launcher and the
+JPEG-ing them, Xvfb copying the pixels, mouseproxy shipping them, the launcher and the
 proxy idling beside them. That is one budget and five processes, so "it is slow" never
 had an owner: the performance line says what the quota is and nothing about where it
 went.
@@ -61,8 +61,6 @@ def label_for(cmd):
         return "x11vnc"
     if "xvfb" in low:
         return "Xvfb"
-    if "websockify" in low:
-        return "websockify"
     if "mouseproxy" in low:
         return "mouseproxy"
     if "fpswatch" in low:

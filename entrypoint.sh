@@ -2,10 +2,10 @@
 set -Eeuo pipefail
 
 : "${NOVNC_PORT:=8080}"
-# websockify listens here, on loopback only: the port the app exposes belongs to
-# mouseproxy.py, which serves noVNC's files, relays that websocket and injects the
-# relative mouse motion the look pad needs.
-: "${WS_PORT:=8081}"
+# The port the app exposes belongs to mouseproxy.py: it serves noVNC's files, speaks
+# the RFB websocket to x11vnc directly, and injects the pointer motion and the clicks
+# the overlays need. websockify used to sit behind it and is gone; the proxy's start
+# below says why.
 : "${VNC_PORT:=5900}"
 : "${SCREEN_WIDTH:=800}"
 : "${SCREEN_HEIGHT:=500}"
@@ -185,7 +185,7 @@ CPU_BUDGET="$CPU_CORE_COUNT"
 #
 # Minecraft's process is more than its Java heap: metaspace, the code cache, GC
 # structures, thread stacks, LWJGL and NeoForge's native buffers, and Mesa's
-# llvmpipe framebuffers all live outside it, and Xvfb, x11vnc, websockify and
+# llvmpipe framebuffers all live outside it, and Xvfb, x11vnc, the proxy and
 # Prism live outside the JVM. So the heap ceiling is a share of the cgroup's
 # memory limit with room left for everything else, not the whole allocation.
 # The app platforms enforce RAM with that limit; without one there is nothing to
@@ -238,7 +238,7 @@ fi
 # Every stage between the game and the device costs the same number of pixels, and
 # they all run on this container's CPU: llvmpipe shades the HUD and blits the world
 # onto the window, the driver copies the frame out, x11vnc reads the damaged
-# rectangles, JPEGs them, and websockify ships them. RenderScale already made the
+# rectangles, JPEGs them, and the proxy ships them. RenderScale already made the
 # *world* cheap by drawing it at a third of the window, which is why the terrain is
 # no longer what a frame costs; everything else still ran at the full 800x500, and
 # that is 400,000 pixels of work per frame however small the world is.
@@ -690,11 +690,10 @@ PRISM_PID=""
 FIT_WINDOWS_PID=""
 FIT_PID=""
 VNC_PID=""
-WS_PID=""
 PROXY_PID=""
 cleanup() {
   trap - EXIT INT TERM
-  for pid in "$PROXY_PID" "$WS_PID" "$VNC_PID" "$FIT_WINDOWS_PID" "$FIT_PID" "$PRISM_PID" "$DESKTOP_PID" "$DBUS_PID" "$XVFB_PID"; do
+  for pid in "$PROXY_PID" "$VNC_PID" "$FIT_WINDOWS_PID" "$FIT_PID" "$PRISM_PID" "$DESKTOP_PID" "$DBUS_PID" "$XVFB_PID"; do
     if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
       kill "$pid" 2>/dev/null || true
     fi
@@ -1072,6 +1071,23 @@ SESSION_ENV=(HOME=/home/cloud DISPLAY=:0
   GDK_SCALE=1
   GDK_DPI_SCALE="$UI_SCALE")
 
+# The page's Prism button runs this command. The launcher needs the session's
+# environment — dbus, XDG_RUNTIME_DIR, the UI scale — and that is built here, so the
+# command is written here too rather than guessed at in mouseproxy.py. Regenerated
+# every boot so it cannot go stale; kept on /data so a redeploy does not lose it.
+PRISM_LAUNCHER=/data/.config/cloudpc-launch-prism
+mkdir -p /data/.config
+{
+  echo '#!/bin/sh'
+  echo 'exec env \'
+  for setting in "${SESSION_ENV[@]}"; do
+    printf '  %q \\\n' "$setting"
+  done
+  echo '  nice -n 10 prismlauncher "$@"'
+} > "$PRISM_LAUNCHER"
+chmod 755 "$PRISM_LAUNCHER"
+chown cloud:cloud "$PRISM_LAUNCHER"
+
 if [[ "$SESSION" == "lite" ]] && command -v openbox >/dev/null 2>&1; then
   seed_openbox_menu
   echo "CloudPC: starting openbox session (llvmpipe limited to ${LP_NUM_THREADS} CPU thread(s))..."
@@ -1190,37 +1206,14 @@ if [[ "$VNC_READY" != "1" ]]; then
   exit 1
 fi
 
-# websockify only has to carry the RFB socket now; noVNC's files and the mouse
-# endpoint are served by mouseproxy.py on the exposed port, in front of it.
-#
-# It used to run at nice 19, on the reasoning that a late pixel costs nothing. That
-# is wrong for half of what it carries: RFB is one socket, and the player's keys and
-# trackpad presses travel up the same relay as the frames coming down. A relay that
-# is starved for a slice does not only make the picture late, it makes the controls
-# late, which is the one delay a player feels directly. 10 still yields the core to
-# the game first, without putting input behind a full frame's worth of pixels.
-echo "CloudPC: starting websockify on 127.0.0.1:${WS_PORT}..."
-nice -n 10 websockify "127.0.0.1:${WS_PORT}" "127.0.0.1:${VNC_PORT}" &
-WS_PID=$!
-
-WS_READY=0
-for _ in $(seq 1 40); do
-  if ! kill -0 "$WS_PID" 2>/dev/null; then
-    echo "ERROR: websockify exited during startup."
-    wait "$WS_PID" || true
-    exit 1
-  fi
-  if (echo >/dev/tcp/127.0.0.1/"${WS_PORT}") >/dev/null 2>&1; then
-    WS_READY=1
-    break
-  fi
-  sleep 0.5
-done
-if [[ "$WS_READY" != "1" ]]; then
-  echo "ERROR: websockify did not listen on 127.0.0.1:${WS_PORT}."
-  ps aux | grep '[w]ebsockify' || true
-  exit 1
-fi
+# The RFB websocket is spoken by mouseproxy.py itself, straight to x11vnc. It used to
+# be relayed through websockify, which put a second Python process and a copy of every
+# frame — and every keystroke — in both directions between the encoder and the player,
+# for nothing: the proxy already terminates the browser's websocket, so pointing that
+# at the VNC socket is strictly less work. It also puts TCP_NODELAY on the one hop
+# that matters, from the encoder to the socket, so a button press is not held behind
+# an ACK. The proxy stays at nice 10: it carries the player's input now as well as the
+# picture, so it may not be starved, and it still yields the core to the game first.
 
 # Which process is spending the quota. The performance line says what the budget is;
 # this says who takes it, because llvmpipe lives inside the JVM and "the game is slow"
@@ -1232,7 +1225,7 @@ CLOUDPC_CPU_PERCENT="$CPU_QUOTA_PERCENT" CPU_LOG_INTERVAL="$CPU_LOG_INTERVAL" \
 echo "CloudPC: starting noVNC and relative mouse on 0.0.0.0:${NOVNC_PORT}..."
 runuser -u cloud -- env HOME=/home/cloud DISPLAY=:0 \
   CLOUDPC_WEB_ROOT=/usr/share/novnc \
-  CLOUDPC_WS_UPSTREAM="127.0.0.1:${WS_PORT}" \
+  CLOUDPC_WS_UPSTREAM="127.0.0.1:${VNC_PORT}" \
   NOVNC_PORT="${NOVNC_PORT}" \
   CLOUDPC_DISPLAY=:0 \
   CLOUDPC_SCREEN_WIDTH="${SCREEN_WIDTH}" \
@@ -1240,7 +1233,8 @@ runuser -u cloud -- env HOME=/home/cloud DISPLAY=:0 \
   CLOUDPC_STREAM_FILE="${STREAM_FILE}" \
   CLOUDPC_FPS_FILE="${FPS_FILE}" \
   CLOUDPC_CPU_CORES="${CPU_BUDGET}" \
-  python3 /opt/cloudpc/mouseproxy.py &
+  CLOUDPC_PRISM_LAUNCHER="${PRISM_LAUNCHER}" \
+  nice -n 10 python3 /opt/cloudpc/mouseproxy.py &
 PROXY_PID=$!
 
 NOVNC_READY=0
@@ -1266,7 +1260,7 @@ echo "CloudPC: noVNC is listening on port ${NOVNC_PORT}; mouse look uses relativ
 
 # Prism is niced so a first launch cannot starve the stream, but the game is its child
 # and inherits that priority — which left Minecraft below Xvfb (nice 0) and level with
-# websockify, on a box where it is the one thing that has to be fast. The X server must
+# the RFB relay, on a box where it is the one thing that has to be fast. The X server must
 # stay its equal, because the game blocks on it to present, and everything else stays
 # below. New instances are caught as they appear; a relaunch inside a session is too.
 lift_game_priority() {
@@ -1289,10 +1283,10 @@ fi
 
 # Supervise all core services. If one exits, report which one before shutdown.
 set +e
-wait -n "$XVFB_PID" "$DBUS_PID" "$DESKTOP_PID" "$VNC_PID" "$WS_PID" "$PROXY_PID"
+wait -n "$XVFB_PID" "$DBUS_PID" "$DESKTOP_PID" "$VNC_PID" "$PROXY_PID"
 status=$?
 set -e
-for name in XVFB DBUS DESKTOP VNC WS PROXY; do
+for name in XVFB DBUS DESKTOP VNC PROXY; do
   pidvar="${name}_PID"
   pid="${!pidvar}"
   if [[ -n "$pid" ]] && ! kill -0 "$pid" 2>/dev/null; then
