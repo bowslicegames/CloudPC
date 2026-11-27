@@ -42,7 +42,7 @@ For local testing, the image needs an x86-64 Linux host for the included Prism/J
 3. In GitHub, open the newly created package under your profile → Packages. If you want Altare to pull without registry credentials, change the package visibility to **Public**. Otherwise create a GitHub token with `read:packages` and use Altare's private-registry credentials option.
 4. In Altare, create a Docker App using the published image.
 5. Set the container port to `8080`.
-6. Set the app resource limits. Start with **4096 MB RAM**, **125% CPU**, and the largest disk allocation you can spare. Your team pool is shared, so make sure other servers still have resources.
+6. Set the app resource limits. **125% CPU and 4096 MB RAM** is the floor that still runs; **300% CPU and 6 GB RAM** is the allocation the defaults are tuned for. Give the disk the largest allocation you can spare. Your team pool is shared, so make sure other servers still have resources.
 7. Configure persistent storage for `/data` if the Docker App offers a persistent volume/mount. **Do not assume the container filesystem survives image redeploys.** If persistent mounts are not available for your selected Altare app type, use an Altare-supported persistent storage service or a Debian sandbox instead; do not store your only Minecraft worlds in the disposable container layer.
 8. Set `VNC_PASSWORD` as an environment variable before the first start. Use a unique password (never your Microsoft password); at most 8 characters are used. If you leave it unset, the container generates a password on first boot and prints it once in the app logs. Do not publish the address or share it with untrusted people; for internet-facing use, put the app behind a private network, VPN or an authenticated reverse proxy as well.
 9. Start the app and open its HTTPS address. If the page does not load, check the app logs and confirm that port `8080` is exposed.
@@ -108,9 +108,10 @@ Environment variables that control the cost of the desktop and the streamer:
 - `WINDOW_MARGIN` (default `8`) and `WINDOW_TITLEBAR` (default `24`) — the desktop kept visible around every window, and the titlebar height allowed for above it.
 - `FIT_WINDOWS=0` — stop fitting windows and leave each one at the size the application asks for.
 
-## Resource recommendations for a 6 GB / 150% CPU team pool
+## Resource recommendations for a 6 GB / 300% CPU team pool
 
-- Give CloudPC about 4 GB RAM and 125% CPU only if the rest of your team has enough left.
+- **300% CPU and 6 GB RAM** is what the defaults are sized for: three llvmpipe workers, Mesa's threaded GL dispatch on (it needs 175% of a core before that thread has somewhere to run), the stream at the full 800×500, and the short x11vnc polling pair, so a frame is looked at and encoded inside 28 ms instead of 46.
+- **125% CPU, about 4 GB RAM** is the floor, and the stream has to shrink to 62% of the screen with the dispatch thread off, because there is no second core to put it on. Give CloudPC that much only if the rest of your team has enough left.
 - Java heap: 2.5 GiB is what the instance ships with and 3 GiB is a comfortable ceiling for this scene; a 4 GiB maximum is fine but is headroom, not speed. The heap does not make frames faster — it only avoids collection stalls and running out of memory while chunks generate — and a heap that is allowed to grow to 4 GiB can press the whole container against its 6 GB limit, where the out-of-memory killer usually takes the game or the X server. If the app restarts by itself while you play, lower it first.
 - Start with 2–4 chunks render distance, low graphics, no shaders and a small modpack.
 - Close other desktop applications while Minecraft is running.

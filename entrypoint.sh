@@ -51,8 +51,8 @@ unset OFFLOAD_WIDTH OFFLOAD_HEIGHT
 : "${SESSION:=lite}"
 # How long x11vnc sleeps between framebuffer polls and how long it batches damage
 # before encoding. Saving CPU here costs a few milliseconds of stream latency, and
-# what the encoder can afford depends on how many pixels the stream carries, so both
-# are set with the stream size below instead of here.
+# what the encoder can afford depends on how many pixels the stream carries and how
+# many cores the container has, so both are set with those below instead of here.
 
 # glibc gives every thread its own malloc arena (8 x cores of 64 MB mappings). On
 # a one-core container with Java, Mesa and GTK all allocating, capping the arenas
@@ -204,12 +204,19 @@ stream_size() {
   echo "$width $height"
 }
 
-# The stream's own timing. A smaller framebuffer is cheap to read and encode, so it
-# can be shipped more often: at 640x400 and below the encoder's share of a core is
-# small enough that a 28 ms poll-and-batch still leaves the game the core, and the
-# stream stops being what caps the picture at twenty updates a second. At full size
-# the old 46 ms stays, because there every encode is four times the work.
-if (( $(stream_scale) <= 80 )); then
+# The stream's own timing: how often x11vnc looks for damage, and how long it batches
+# what it found before encoding. Both halves of the delay it adds, so both move
+# together. On one or two cores the encoder is a rival for the same core the game
+# renders on: full size keeps the conservative 46 ms, and a stream at 640x400 or below
+# — four times less to read and encode — gets 28 ms. At three cores that rivalry is
+# gone, because the render thread and the raster workers can run while x11vnc looks,
+# so full size gets the short pair as well. That spends a little of the bonus on the
+# one thing the user actually feels, 18 ms of the frame's age, instead of banking CPU
+# nobody is short of.
+if (( CPU_BUDGET >= 3 )); then
+  : "${VNC_WAIT:=10}"
+  : "${VNC_DEFER:=18}"
+elif (( $(stream_scale) <= 80 )); then
   : "${VNC_WAIT:=12}"
   : "${VNC_DEFER:=16}"
 else
